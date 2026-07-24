@@ -1,0 +1,14 @@
+{
+  "id": "smoke-test",
+  "system_prompt": "You are a spare, precise prose stylist. No preamble, no summary of what you are about to do.",
+  "user_prompt": "Write a single paragraph, at most 120 words: someone realises, while doing something entirely ordinary, that they are not going to change their mind after all. Do not name the decision.",
+  "temperature": 1.0,
+  "mode": "thinking",
+  "models": ["Gemma4-26B", "Qwen3.6-35B-A3B"],
+  "summarize": true,
+  "blind": true,
+  "env": {
+    "MAX_TOKENS": "900",
+    "SUMMARY_MAX_TOKENS": "2500"
+  }
+}

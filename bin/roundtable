@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""Roundtable — blind panel benchmarking for local LLMs.
+
+    roundtable report SESSION [SESSION...]     render sessions as HTML
+    roundtable report --all [ROOT]             render every session under ROOT
+    roundtable submit JOB.json                 put a job in the queue
+    roundtable work                            run queued jobs, one at a time
+    roundtable up                              serve the form + run the worker (the app)
+    roundtable serve                           serve the form and reports only
+    roundtable status                          queue depth and what the worker is doing
+
+Reports are written to <session>/report.html, atomically, so a browser reloading
+the page can never catch a partial file. Requires nothing but Python 3.
+"""
+import argparse
+import json
+import os
+import sys
+
+# realpath, not abspath: this is meant to be symlinked onto PATH.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+
+from roundtable import consensus, ranks, report, session as session_mod
+from roundtable import serve, spool, worker
+
+DEFAULT_ROOT = os.environ.get(
+    "ROUNDTABLE_SESSIONS", os.path.expanduser("~/Apps/creative-bench"))
+
+
+def find_sessions(root):
+    """Directories under root that look like sessions, newest first."""
+    out = []
+    for name in sorted(os.listdir(root), reverse=True):
+        path = os.path.join(root, name)
+        if os.path.isdir(path) and any(
+                f.endswith(".md") for f in os.listdir(path)):
+            out.append(path)
+    return out
+
+
+def build(sdir, out_path=None, running=False, refresh=15, quiet=False,
+          include_prompts=True):
+    """Render one session. -> path written, or None if there was nothing to read."""
+    data = session_mod.load(sdir)
+    if not data:
+        if not quiet:
+            print("  %s: no result files — skipped" % os.path.basename(sdir))
+        return None
+    rankings = ranks.extract_all(data)
+    result = consensus.score(data, rankings)
+    html = report.render(data, result, rankings, running=running, refresh=refresh,
+                         include_prompts=include_prompts)
+    path = out_path or os.path.join(data["dir"], "report.html")
+    report.write(path, html)
+    if not quiet:
+        parsed = sum(1 for r in rankings if r["ranks"])
+        print("  %-22s %2d runs · %d/%d verdicts read · %s"
+              % (data["name"], len(data["runs"]), parsed, len(rankings), path))
+    return path
+
+
+def cmd_report(args):
+    targets = list(args.sessions)
+    if args.all:
+        targets += find_sessions(args.all)
+    if not targets:
+        print("give a session directory, or --all", file=sys.stderr)
+        return 2
+    if args.output and len(targets) > 1:
+        print("-o works with a single session only", file=sys.stderr)
+        return 2
+
+    written = 0
+    for sdir in targets:
+        if not os.path.isdir(sdir):
+            print("  %s: not a directory — skipped" % sdir, file=sys.stderr)
+            continue
+        if build(sdir, args.output, args.running, args.refresh, args.quiet,
+                 include_prompts=not args.no_prompts):
+            written += 1
+    if not args.quiet:
+        print("%d report(s) written" % written)
+    return 0 if written else 1
+
+
+def cmd_submit(args):
+    with open(args.job, encoding="utf-8") as f:
+        job = json.load(f)
+    job_id = spool.submit(job, args.spool)
+    print("queued %s" % job_id)
+    return 0
+
+
+def cmd_work(args):
+    def on_report(session_dir, running):
+        build(session_dir, running=running, refresh=args.refresh, quiet=True)
+
+    spool.ensure(args.spool)
+    print("worker ready · spool %s" % (args.spool or spool.DEFAULT_SPOOL))
+    ran = worker.loop(sp=args.spool, runner=args.runner, on_report=on_report,
+                      once=args.once, drain=args.drain,
+                      report_every=args.report_every,
+                      sessions_root=_sessions_root(args))
+    print("worker stopped after %d job(s)" % ran)
+    return 0
+
+
+def _sessions_root(args):
+    return getattr(args, "sessions", None) or DEFAULT_ROOT
+
+
+def cmd_serve(args):
+    serve.serve(root=_sessions_root(args), host=args.host, port=args.port,
+                sp=args.spool, open_browser=not args.no_browser)
+    return 0
+
+
+def cmd_up(args):
+    """Server + worker in one process: the whole app, one command."""
+    import threading
+
+    stop = threading.Event()
+    root = _sessions_root(args)
+
+    def on_report(session_dir, running):
+        build(session_dir, running=running, refresh=args.refresh, quiet=True)
+
+    def work():
+        try:
+            worker.loop(sp=args.spool, runner=args.runner, on_report=on_report,
+                        should_stop=stop.is_set, sessions_root=root,
+                        log=lambda *a: None)
+        except Exception as exc:                     # keep the server alive
+            print("worker crashed: %r" % exc, file=sys.stderr)
+
+    thread = threading.Thread(target=work, name="roundtable-worker", daemon=True)
+    thread.start()
+    print("worker running in-process · Ctrl-C to stop both")
+    try:
+        serve.serve(root=root, host=args.host, port=args.port, sp=args.spool,
+                   open_browser=not args.no_browser)
+    finally:
+        stop.set()
+        thread.join(timeout=35)
+    return 0
+
+
+def cmd_status(args):
+    counts = spool.counts(args.spool)
+    print("queue %(queue)d · running %(running)d · done %(done)d · failed %(failed)d"
+          % counts)
+    beat = spool.read_heartbeat(args.spool)
+    if not beat:
+        print("worker: never started")
+        return 0
+    bits = ["worker: %s" % beat.get("state", "?"), "pid %s" % beat.get("pid", "?"),
+            "last seen %s" % beat.get("seen", "?")]
+    if beat.get("job"):
+        bits.append("job %s" % beat["job"])
+    if beat.get("session"):
+        bits.append(beat["session"])
+    print(" · ".join(bits))
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        prog="roundtable", description=__doc__.splitlines()[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    subs = p.add_subparsers(dest="command")
+
+    r = subs.add_parser("report", help="render sessions as standalone HTML")
+    r.add_argument("sessions", nargs="*", help="session directories")
+    r.add_argument("--all", nargs="?", const=DEFAULT_ROOT, metavar="ROOT",
+                   help="render every session under ROOT (default: %s)" % DEFAULT_ROOT)
+    r.add_argument("-o", "--output", help="output file (single session only)")
+    r.add_argument("--running", action="store_true",
+                   help="mark the session as in flight and self-refresh the page")
+    r.add_argument("--refresh", type=int, default=15, metavar="SEC",
+                   help="seconds between self-refreshes (default 15)")
+    r.add_argument("--no-prompts", action="store_true",
+                   help="leave the system/user prompt out of the report, for sharing")
+    r.add_argument("-q", "--quiet", action="store_true")
+    r.set_defaults(func=cmd_report)
+
+    s = subs.add_parser("submit", help="put a job in the queue")
+    s.add_argument("job", help="path to a session.json")
+    s.add_argument("--spool", help="spool directory (default %s)" % spool.DEFAULT_SPOOL)
+    s.set_defaults(func=cmd_submit)
+
+    w = subs.add_parser("work", help="run queued jobs, one at a time")
+    w.add_argument("--spool", help="spool directory (default %s)" % spool.DEFAULT_SPOOL)
+    w.add_argument("--sessions", help="sessions root (default %s)" % DEFAULT_ROOT)
+    w.add_argument("--runner", help="bench script to shell out to (default %s)"
+                                    % worker.DEFAULT_RUNNER)
+    w.add_argument("--once", action="store_true",
+                   help="run one job (or exit if the queue is empty) and stop")
+    w.add_argument("--drain", action="store_true",
+                   help="run until the queue is empty, then stop")
+    w.add_argument("--refresh", type=int, default=15, metavar="SEC",
+                   help="self-refresh interval written into the live report")
+    w.add_argument("--report-every", type=float, default=worker.REPORT_EVERY,
+                   metavar="SEC", help="how often to rebuild the live report")
+    w.set_defaults(func=cmd_work)
+
+    for name, help_text in (("serve", "serve the form and reports over HTTP"),
+                            ("up", "serve AND run the worker: the whole app")):
+        c = subs.add_parser(name, help=help_text)
+        c.add_argument("--host", default=serve.DEFAULT_HOST,
+                       help="interface to bind (default %s — localhost only)"
+                            % serve.DEFAULT_HOST)
+        c.add_argument("--port", type=int, default=serve.DEFAULT_PORT,
+                       help="port (default %d)" % serve.DEFAULT_PORT)
+        c.add_argument("--sessions", help="sessions root (default %s)" % DEFAULT_ROOT)
+        c.add_argument("--spool", help="spool directory (default %s)"
+                                       % spool.DEFAULT_SPOOL)
+        c.add_argument("--no-browser", action="store_true",
+                       help="don't open a browser tab on startup (used by the "
+                            "systemd service, which has no display)")
+        if name == "up":
+            c.add_argument("--runner", help="bench script to shell out to")
+            c.add_argument("--refresh", type=int, default=15, metavar="SEC",
+                           help="self-refresh interval in the live report")
+            c.set_defaults(func=cmd_up)
+        else:
+            c.set_defaults(func=cmd_serve)
+
+    st = subs.add_parser("status", help="queue depth and worker state")
+    st.add_argument("--spool", help="spool directory (default %s)" % spool.DEFAULT_SPOOL)
+    st.set_defaults(func=cmd_status)
+
+    args = p.parse_args(argv)
+    if not getattr(args, "func", None):
+        p.print_help()
+        return 2
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,33 @@
+[Unit]
+# Roundtable bench worker: claims queued jobs and runs them one at a time.
+#
+# Install as a *user* unit, not a system one -- it needs your models, your
+# GPU session and your home directory:
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp packaging/roundtable-worker.service ~/.config/systemd/user/
+#   # edit ExecStart below if the repo is not at ~/Apps/roundtable
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now roundtable-worker
+#   journalctl --user -u roundtable-worker -f
+#
+# Never run two of these. One worker is what keeps one model in VRAM at a time.
+Description=Roundtable bench worker
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/Apps/roundtable/bin/roundtable work
+# Where sessions, the queue and the bench script live. Uncomment to override.
+#Environment=ROUNDTABLE_SESSIONS=%h/Apps/creative-bench
+#Environment=ROUNDTABLE_SPOOL=%h/.local/state/roundtable
+#Environment=ROUNDTABLE_RUNNER=%h/Apps/bin/creative-bench.sh
+Restart=on-failure
+RestartSec=10
+# A bench run can take a long time; let it finish shutting down properly.
+TimeoutStopSec=60
+# Be a polite neighbour to whatever else wants the GPU.
+Nice=5
+
+[Install]
+WantedBy=default.target

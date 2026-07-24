@@ -1,0 +1,817 @@
+"""A small HTTP server for browsing sessions and watching a run.
+
+Deliberately boring: stdlib only, no framework, no session state, no streaming.
+It serves files the worker has already written and an index of the sessions on
+disk. Live progress needs nothing from the server, because a live report
+refreshes itself.
+
+Binds to localhost by default. Serving is read-only and confined to the sessions
+root -- see ``_resolve``, which is the one security-relevant function in here.
+"""
+import html
+import json
+import mimetypes
+import os
+import posixpath
+import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from . import consensus, ranks
+from . import models as models_mod
+from . import presets as presets_mod
+from . import report, session as session_mod, spool
+
+DEFAULT_PORT = 8420
+DEFAULT_HOST = "127.0.0.1"
+
+ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+
+FAVICON_HEAD = (
+    '<link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon-32.png">'
+    '<link rel="icon" type="image/png" sizes="16x16" href="/assets/favicon-16.png">'
+    '<link rel="apple-touch-icon" sizes="180x180" href="/assets/favicon-180.png">'
+)
+LOGO_HTML = ('<img src="/assets/logo.png" alt="Roundtable" class="logo">')
+
+INDEX_CSS = report.CSS + """
+.logo{display:block;max-width:420px;width:100%;height:auto;margin:0 0 6px}
+.row{display:flex;align-items:baseline;gap:12px;padding:9px 0;
+  border-bottom:1px solid var(--grid)}
+.row:last-child{border-bottom:none}
+.row a{font-weight:600;text-decoration:none}
+.row a:hover{text-decoration:underline}
+.row .meta{color:var(--muted);font-size:13px;margin-left:auto;
+  font-variant-numeric:tabular-nums}
+.pill{font-size:11.5px;text-transform:uppercase;letter-spacing:.05em;
+  border:1px solid var(--border);border-radius:999px;padding:1px 8px;
+  color:var(--ink2)}
+.live{border-color:var(--pos);color:var(--pos)}
+label{display:block;font-weight:600;font-size:13.5px;margin:0 0 5px}
+.field{margin:0 0 20px}
+.hint{color:var(--muted);font-size:12.5px;margin:5px 0 0;font-weight:400}
+select,input[type=text],input[type=number],textarea{width:100%;font:inherit;
+  font-size:14px;color:var(--ink);background:var(--page);
+  border:1px solid var(--axis);border-radius:8px;padding:9px 10px}
+textarea{font-size:13.5px;line-height:1.5;resize:vertical;min-height:90px}
+select:focus,input:focus,textarea:focus{outline:2px solid var(--series);
+  outline-offset:-1px;border-color:var(--series)}
+.grid{display:flex;gap:14px;flex-wrap:wrap}
+.grid>div{flex:1;min-width:160px}
+.checks{display:grid;grid-template-columns:1fr;gap:2px;
+  max-height:290px;overflow-y:auto;border:1px solid var(--border);
+  border-radius:8px;padding:8px 10px}
+.check{display:flex;align-items:center;gap:9px;padding:4px 2px;font-size:13.5px;
+  font-weight:400}
+.check input{width:auto;margin:0}
+.check .sz{margin-left:auto;color:var(--muted);font-size:12.5px;
+  font-variant-numeric:tabular-nums}
+.check code{font-size:12.5px}
+.models .check{display:grid;grid-template-columns:100px 100px 1fr auto;gap:9px}
+.models .check.head{color:var(--muted);font-size:11px;
+  padding-bottom:6px;border-bottom:1px solid var(--grid);margin-bottom:2px}
+.models .check.head span:nth-child(1),.models .check.head span:nth-child(2){
+  text-align:center;line-height:1.25}
+.models .check.head span:nth-child(4){text-align:right}
+.models .check input{justify-self:center}
+button{font:inherit;font-size:14.5px;font-weight:600;color:#fff;
+  background:var(--series);border:none;border-radius:8px;padding:11px 22px;
+  cursor:pointer}
+button:hover{filter:brightness(1.08)}
+button.ghost{background:none;color:var(--series);border:1px solid var(--border);
+  font-weight:500}
+.actions{display:flex;gap:10px;align-items:center;margin-top:6px}
+.err{border-left:3px solid var(--pos);padding-left:12px;margin:0 0 18px;
+  color:var(--ink2);font-size:13.5px}
+.notice{border-left:3px solid var(--series);padding-left:12px;margin:0 0 18px;
+  color:var(--ink2);font-size:13.5px}
+.preset-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  margin-top:-6px}
+.preset-actions input[type=text]{flex:1;min-width:160px;padding:7px 9px;
+  font-size:13px}
+.preset-actions button{font-size:13px;font-weight:500;padding:7px 12px;
+  border-radius:7px;border:1px solid var(--border);background:none;
+  color:var(--ink2);cursor:pointer}
+.preset-actions button:hover{border-color:var(--series);color:var(--series)}
+.preset-actions #delete_preset:hover{border-color:var(--pos);color:var(--pos)}
+.preset-actions a{font-size:12.5px;color:var(--muted);text-decoration:none;
+  margin-left:auto}
+.preset-actions a:hover{color:var(--series)}
+.preset-actions .hint{width:100%;margin:0}
+"""
+
+
+def _resolve(root, rel):
+    """Map a URL path to a file inside root, or None if it escapes.
+
+    Everything served goes through here. ``..`` segments, absolute paths and
+    symlinks that point outside the root all resolve to None rather than to a
+    file, so a URL can never read outside the sessions directory.
+    """
+    rel = urllib.parse.unquote(rel).lstrip("/")
+    root = os.path.realpath(root)
+    target = os.path.realpath(os.path.join(root, rel))
+    if target != root and not target.startswith(root + os.sep):
+        return None
+    return target
+
+
+def list_sessions(root):
+    """-> [{name, path, report, runs, judges, live, mtime}] newest first."""
+    out = []
+    try:
+        names = sorted(os.listdir(root), reverse=True)
+    except OSError:
+        return out
+    for name in names:
+        path = os.path.join(root, name)
+        if not os.path.isdir(path):
+            continue
+        try:
+            files = os.listdir(path)
+        except OSError:
+            continue
+        results = [f for f in files
+                   if f.endswith(".md") and not f.startswith(("SUMMARIZE", "summary_"))]
+        if not results:
+            continue
+        has_report = "report.html" in files
+        live = False
+        if has_report:
+            try:
+                with open(os.path.join(path, "report.html"), encoding="utf-8") as f:
+                    live = 'http-equiv="refresh"' in f.read(4000)
+            except OSError:
+                pass
+        out.append({
+            "name": name, "path": path, "report": has_report,
+            "runs": len(results),
+            "judges": len([f for f in files if f.startswith("summary_")]),
+            "live": live,
+            "mtime": os.path.getmtime(path),
+        })
+    return out
+
+
+def render_index(root, sp=None):
+    counts = spool.counts(sp)
+    beat = spool.read_heartbeat(sp) or {}
+    rows = list_sessions(root)
+
+    parts = ['<!doctype html><html lang="en"><head><meta charset="utf-8">',
+             '<meta name="viewport" content="width=device-width,initial-scale=1">']
+    if any(r["live"] for r in rows) or counts["running"] or counts["queue"]:
+        parts.append('<meta http-equiv="refresh" content="15">')
+    parts.append("<title>Roundtable</title>%s<style>%s</style></head><body>"
+                 "<div class=\"wrap\">" % (FAVICON_HEAD, INDEX_CSS))
+    parts.append(LOGO_HTML)
+    parts.append("<h1>Roundtable</h1>")
+
+    worker_state = beat.get("state", "never started")
+    bits = ["worker %s" % worker_state,
+            "queue %d" % counts["queue"],
+            "done %d" % counts["done"]]
+    if counts["failed"]:
+        bits.append("failed %d" % counts["failed"])
+    parts.append('<p class="sub">%s · %d session(s) in %s</p>'
+                 % (html.escape(" · ".join(bits)), len(rows), html.escape(root)))
+
+    parts.append('<p style="margin:0 0 20px"><a href="/new" style="display:'
+                 'inline-block;background:var(--series);color:#fff;font-weight:600;'
+                 'font-size:14.5px;text-decoration:none;padding:11px 22px;'
+                 'border-radius:8px">New run</a></p>')
+
+    if not rows:
+        parts.append('<div class="card"><p class="note">No sessions yet. '
+                     'Start one with <b>New run</b> above.</p></div>')
+    else:
+        parts.append('<div class="card">')
+        for r in rows:
+            link = ("/s/%s/report.html" % urllib.parse.quote(r["name"])
+                    if r["report"] else "/s/%s/" % urllib.parse.quote(r["name"]))
+            pill = ('<span class="pill live">running</span>' if r["live"]
+                    else '<span class="pill">%d judges</span>' % r["judges"])
+            parts.append('<div class="row"><a href="%s">%s</a>%s'
+                         '<span class="meta">%d runs · %s</span></div>'
+                         % (link, html.escape(r["name"]), pill, r["runs"],
+                            time.strftime("%Y-%m-%d %H:%M",
+                                          time.localtime(r["mtime"]))))
+        parts.append("</div>")
+
+    parts.append("<footer>Reports are static files. A running session&rsquo;s report "
+                 "reloads itself until it finishes.</footer>")
+    return "\n".join(parts) + "\n</div></body></html>\n"
+
+
+def _page(title, body, refresh=None):
+    parts = ['<!doctype html><html lang="en"><head><meta charset="utf-8">',
+             '<meta name="viewport" content="width=device-width,initial-scale=1">']
+    if refresh:
+        parts.append('<meta http-equiv="refresh" content="%s">' % refresh)
+    parts.append("<title>%s</title>%s<style>%s</style></head><body>"
+                 '<div class="wrap">' % (html.escape(title), FAVICON_HEAD, INDEX_CSS))
+    return "\n".join(parts + [body]) + "\n</div></body></html>\n"
+
+
+def render_form(error=None, values=None, models_root=None, presets=None, notice=None):
+    """The submit form: pick a role, write a prompt, tick some models."""
+    values = values or {}
+    presets = presets if presets is not None else presets_mod.load()
+    found = models_mod.discover(models_root)
+    bundled_ids = presets_mod.bundled_ids()
+
+    def val(key, default=""):
+        return html.escape(str(values.get(key, default)))
+
+    # A preset chosen via ?preset=id (after saving, or a direct link) has no
+    # system_prompt in `values` yet -- the browser never round-tripped it, so
+    # fill it server-side rather than leaving the textarea blank until the
+    # dropdown's onchange fires.
+    selected = presets_mod.find(values.get("preset"), presets) if values.get("preset") else None
+    if selected and not values.get("system_prompt"):
+        values = dict(values, system_prompt=selected["system_prompt"])
+
+    body = [LOGO_HTML, "<h1>New run</h1>",
+            '<p class="sub">Round 1: every model answers the same prompt. '
+            'Round 2 (optional): they judge each other, blind. Round 3 '
+            '(optional): the panel&rsquo;s top pick writes a final synthesis. '
+            '<a href="/">All sessions</a></p>']
+    if notice:
+        body.append('<div class="notice">%s</div>' % html.escape(notice))
+    if error:
+        body.append('<div class="err">%s</div>' % html.escape(error))
+
+    body.append('<form method="post" action="/submit"><div class="card">')
+
+    # Role preset -> fills the system prompt, which stays editable.
+    body.append('<div class="field"><label for="preset">Role</label>'
+                '<select id="preset" name="preset">'
+                '<option value="">Custom — write your own system prompt</option>')
+    for p in presets:
+        body.append('<option value="%s"%s>%s</option>'
+                    % (html.escape(p["id"]),
+                       " selected" if values.get("preset") == p["id"] else "",
+                       html.escape(p["title"])))
+    body.append('</select><p class="hint" id="expects">Choosing a role fills the '
+                'system prompt below. You can edit it afterwards.</p></div>')
+
+    body.append('<div class="field preset-actions">'
+                '<input type="text" id="preset_title" placeholder="Name this role, '
+                'to save it" value="%s">'
+                '<button type="button" id="save_preset">Save as preset</button>'
+                '<button type="button" id="delete_preset"%s>Delete preset</button>'
+                '<a href="#" id="reset_presets">Reset to factory presets</a>'
+                '<span id="preset_status" class="hint"></span></div>'
+                % (html.escape(selected["title"] if selected else ""),
+                   "" if selected else ' style="display:none"'))
+
+    body.append('<div class="field"><label for="system_prompt">System prompt</label>'
+                '<textarea id="system_prompt" name="system_prompt" rows="7" '
+                'placeholder="Who the model should be. Leave empty for none.">%s'
+                '</textarea></div>' % val("system_prompt"))
+
+    body.append('<div class="field"><label for="user_prompt">Prompt</label>'
+                '<textarea id="user_prompt" name="user_prompt" rows="6" required '
+                'placeholder="The task every model gets.">%s</textarea>'
+                '<p class="hint">This is what the models actually answer.</p>'
+                '</div>' % val("user_prompt"))
+
+    # Models -- each row picks the model AND its thinking mode at once: check
+    # "on", "off", or both (= two runs). Checking neither excludes the model.
+    body.append('<div class="field"><label>Models</label>')
+    if not found:
+        body.append('<p class="hint">No .gguf files found under <code>%s</code>. '
+                    'Set <code>ROUNDTABLE_MODELS</code>, or list patterns below.</p>'
+                    % html.escape(models_root or models_mod.DEFAULT_ROOT))
+    else:
+        on_default = set(values.get("think_on") or [])
+        off_default = set(values.get("think_off") or [])
+        has_defaults = bool(on_default or off_default)
+        body.append('<div class="checks models">'
+                    '<div class="check head"><span>Run w/o Think</span>'
+                    '<span>Run w/ Think</span><span>Model</span><span>Size</span>'
+                    '</div>')
+        for m in found:
+            if has_defaults:
+                on, off = m["name"] in on_default, m["name"] in off_default
+            else:
+                off = models_mod.thinking_off_by_default(m["name"])
+                on = not off
+            body.append(
+                '<label class="check"><input type="checkbox" name="think_off" '
+                'value="%s"%s><input type="checkbox" name="think_on" value="%s"%s>'
+                '<code>%s</code><span class="sz">%.1f GB</span></label>'
+                % (html.escape(m["name"]), " checked" if off else "",
+                   html.escape(m["name"]), " checked" if on else "",
+                   html.escape(m["name"]), m["size_gb"]))
+        body.append("</div>")
+        body.append('<p class="hint">%s Defaults follow past results: thinking '
+                    'off for models that scored better that way, on otherwise. '
+                    'Check both boxes for a model to run it twice.</p>'
+                    % html.escape(models_mod.sizes_note(found)))
+    body.append('</div>')
+
+    body.append('<div class="field"><label for="extra_models">Extra model '
+                'patterns</label><input type="text" id="extra_models" '
+                'name="extra_models" value="%s" placeholder="comma-separated '
+                'substrings, e.g. Qwen3.6, Gemma4"><p class="hint">Matched as '
+                'substrings against model paths (no per-model checkboxes for '
+                'these — they run with thinking on). Optional.</p></div>'
+                % val("extra_models"))
+
+    body.append('<div class="grid">')
+    body.append('<div class="field"><label for="temperature">Temperature</label>'
+                '<input type="number" id="temperature" name="temperature" '
+                'step="0.05" min="0" max="2" value="%s"></div>'
+                % val("temperature", "1.0"))
+    body.append('<div class="field"><label for="max_tokens">Max tokens</label>'
+                '<input type="number" id="max_tokens" name="max_tokens" min="64" '
+                'step="64" value="%s"></div>' % val("max_tokens", "8192"))
+    body.append('<div class="field"><label for="seed">Seed</label>'
+                '<input type="text" id="seed" name="seed" value="%s" '
+                'placeholder="random"><p class="hint">Shared by every run.</p>'
+                "</div>" % val("seed"))
+    body.append("</div>")
+
+    body.append('<div class="field"><label class="check">'
+                '<input type="checkbox" id="summarize" name="summarize" value="1"%s> '
+                'Round 2 &mdash; have the models judge each other, blind</label>'
+                '<p class="hint">Doubles the model loads, and is what produces the '
+                'standings, agreement and self-preference charts.</p></div>'
+                % ("" if values and not values.get("summarize") else " checked"))
+    body.append('<div class="field"><label class="check">'
+                '<input type="checkbox" id="meta_summary" name="meta_summary" '
+                'value="1"%s> Round 3 &mdash; have the panel&rsquo;s top pick write a '
+                'final synthesis</label><p class="hint">One more model load, by '
+                'whichever entry the panel rated highest. Needs Round 2.</p></div>'
+                % ("" if values and not values.get("meta_summary") else " checked"))
+    body.append("""<script>
+(function () {
+  var s = document.getElementById('summarize'), m = document.getElementById('meta_summary');
+  function sync() { m.disabled = !s.checked; if (!s.checked) m.checked = false; }
+  s.addEventListener('change', sync); sync();
+})();
+</script>""")
+
+    body.append('<div class="actions"><button type="submit">Queue run</button>'
+                '<a class="ghost" href="/" style="text-decoration:none;'
+                'padding:11px 18px;border-radius:8px;border:1px solid var(--border);'
+                'color:var(--series)">Cancel</a></div>')
+    body.append("</div></form>")
+
+    # The dropdown fills the system prompt and shows what the Prompt box wants.
+    lookup = {p["id"]: {"title": p["title"], "system_prompt": p["system_prompt"],
+                        "expects": p.get("expects", "")} for p in presets}
+    body.append("<script>\nvar PRESETS = %s;\nvar BUNDLED_IDS = %s;\n"
+               % (json.dumps(lookup), json.dumps(sorted(bundled_ids))))
+    body.append("""
+var sel = document.getElementById('preset'),
+    sys = document.getElementById('system_prompt'),
+    expects = document.getElementById('expects'),
+    user = document.getElementById('user_prompt'),
+    title = document.getElementById('preset_title'),
+    delBtn = document.getElementById('delete_preset'),
+    saveBtn = document.getElementById('save_preset'),
+    status = document.getElementById('preset_status'),
+    resetLink = document.getElementById('reset_presets'),
+    baseHint = expects.textContent, dirty = false;
+
+function showDeleteFor(id) { delBtn.style.display = id && PRESETS[id] ? '' : 'none'; }
+
+sel.addEventListener('change', function () {
+  var p = PRESETS[sel.value];
+  if (!p) { expects.textContent = baseHint; title.value = ''; showDeleteFor(null); return; }
+  if (sys.value.trim() && dirty &&
+      !confirm('Replace the system prompt you have written?')) { return; }
+  sys.value = p.system_prompt;
+  dirty = false;
+  title.value = p.title;
+  expects.textContent = p.expects || baseHint;
+  if (p.expects) { user.placeholder = p.expects; }
+  showDeleteFor(sel.value);
+});
+sys.addEventListener('input', function () { dirty = true; });
+
+function say(msg, isError) {
+  status.textContent = msg;
+  status.style.color = isError ? 'var(--pos)' : 'var(--muted)';
+}
+
+saveBtn.addEventListener('click', function () {
+  var name = title.value.trim();
+  if (!name) { say('Give it a name first.', true); title.focus(); return; }
+  var id = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+  if (BUNDLED_IDS.indexOf(id) !== -1 &&
+      !confirm('"' + name + '" is a built-in preset. Save anyway and replace it?')) {
+    return;
+  }
+  var body = new URLSearchParams({title: name, system_prompt: sys.value,
+                                  id: sel.value,
+                                  expects: user.placeholder === baseHint ? '' : user.placeholder});
+  fetch('/presets/save', {method: 'POST', body: body})
+    .then(function (r) { return r.json().then(function (d) { return [r.ok, d]; }); })
+    .then(function (pair) {
+      var ok = pair[0], data = pair[1];
+      if (!ok) { say(data.error || 'Could not save.', true); return; }
+      location.href = '/new?preset=' + encodeURIComponent(data.id) +
+        '&notice=' + encodeURIComponent('Saved "' + data.title + '".' +
+          (data.overwrote_bundled ? ' This replaces the built-in preset of the same name.' : ''));
+    })
+    .catch(function () { say('Could not reach the server.', true); });
+});
+
+delBtn.addEventListener('click', function () {
+  if (!sel.value) { return; }
+  var name = (PRESETS[sel.value] || {}).title || sel.value;
+  if (!confirm('Delete "' + name + '"?' +
+      (BUNDLED_IDS.indexOf(sel.value) !== -1 ? ' This restores the built-in version.' : ''))) {
+    return;
+  }
+  fetch('/presets/delete', {method: 'POST',
+    body: new URLSearchParams({id: sel.value})})
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      location.href = '/new?notice=' + encodeURIComponent(
+        data.reverted ? 'Deleted your edit — the built-in preset is back.' : 'Deleted.');
+    })
+    .catch(function () { say('Could not reach the server.', true); });
+});
+
+resetLink.addEventListener('click', function (e) {
+  e.preventDefault();
+  if (!confirm('Discard every saved and edited preset, back to only the '
+              + 'built-in ones? This cannot be undone.')) {
+    return;
+  }
+  fetch('/presets/reset', {method: 'POST'})
+    .then(function () { location.href = '/new?notice=' + encodeURIComponent(
+      'All custom presets cleared — back to factory defaults.'); })
+    .catch(function () { say('Could not reach the server.', true); });
+});
+</script>""")
+    return _page("New run — Roundtable", "\n".join(body))
+
+
+def job_from_form(fields, models_root=None):
+    """Form fields -> (job dict, error).
+
+    Validation lives here, not in the handler, so it is testable without a
+    socket.
+    """
+    user_prompt = (fields.get("user_prompt") or "").strip()
+    if not user_prompt:
+        return None, "A prompt is required — that is what the models answer."
+
+    # Each checkbox model line carries its own mode: on, off, or both if the
+    # user ticked both boxes. A model in neither list is simply not running.
+    on = {m for m in fields.get("think_on", []) if m.strip()}
+    off = {m for m in fields.get("think_off", []) if m.strip()}
+    checked = []
+    for name in sorted(on | off):
+        if name in on and name in off:
+            checked.append("%s:both" % name)
+        elif name in on:
+            checked.append("%s:thinking" % name)
+        else:
+            checked.append("%s:nothinking" % name)
+
+    mode = fields.get("mode", "thinking")
+    if mode not in ("thinking", "nothinking", "both"):
+        return None, "Thinking must be on, off, or both."
+    # Freeform patterns have no per-model checkboxes, so they use the mode
+    # select above instead of carrying their own ":mode" suffix.
+    extra = [p.strip() for p in (fields.get("extra_models") or "").split(",")
+             if p.strip()]
+    patterns = checked + [p for p in extra if p not in on and p not in off]
+    if not patterns:
+        return None, "Pick at least one model, or give a pattern to match."
+
+    try:
+        temperature = float(fields.get("temperature") or 1.0)
+    except ValueError:
+        return None, "Temperature must be a number."
+    if not 0 <= temperature <= 2:
+        return None, "Temperature must be between 0 and 2."
+
+    job = {
+        "system_prompt": (fields.get("system_prompt") or "").strip(),
+        "user_prompt": user_prompt,
+        "temperature": temperature,
+        "mode": mode,
+        "models": patterns,
+        "summarize": bool(fields.get("summarize")),
+        "meta_summary": bool(fields.get("summarize")) and bool(fields.get("meta_summary")),
+        "blind": True,
+        "preset": fields.get("preset") or None,
+    }
+    seed = (fields.get("seed") or "").strip()
+    if seed:
+        if not seed.isdigit():
+            return None, "Seed must be a whole number, or empty for random."
+        job["seed"] = int(seed)
+    max_tokens = (fields.get("max_tokens") or "").strip()
+    if max_tokens:
+        if not max_tokens.isdigit():
+            return None, "Max tokens must be a whole number."
+        job["env"] = {"MAX_TOKENS": max_tokens}
+    return job, None
+
+
+def find_job_session(job_id, sp=None):
+    """Where has this job got to? -> (state, session_dir or None)."""
+    p = spool.paths(sp)
+    for state in ("done", "failed"):
+        path = os.path.join(p[state], job_id + ".json")
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    return state, json.load(f).get("session_dir")
+            except (OSError, ValueError):
+                return state, None
+    if os.path.exists(os.path.join(p["running"], job_id + ".json")):
+        beat = spool.read_heartbeat(sp) or {}
+        if beat.get("job") == job_id:
+            return "running", beat.get("session")
+        return "running", None
+    if os.path.exists(os.path.join(p["queue"], job_id + ".json")):
+        return "queued", None
+    return "unknown", None
+
+
+def render_job(job_id, root, sp=None):
+    """The waiting page: redirects itself to the report once one exists."""
+    state, session_dir = find_job_session(job_id, sp)
+    if session_dir:
+        name = os.path.basename(session_dir.rstrip("/"))
+        target = "/s/%s/report.html" % urllib.parse.quote(name)
+        if os.path.exists(os.path.join(root, name, "report.html")):
+            return None, target             # hand over to the report itself
+    beat = spool.read_heartbeat(sp) or {}
+    counts = spool.counts(sp)
+
+    if state == "queued":
+        headline, detail = "Queued", (
+            "%d job(s) ahead of this one. The worker takes them in order."
+            % max(0, counts["queue"] - 1))
+        if beat.get("state") in (None, "stopped", "never started"):
+            detail += (" The worker does not look like it is running — start it "
+                       "with roundtable work.")
+    elif state == "running":
+        headline, detail = "Running", (
+            "Loading the first model. This page will switch to the live report "
+            "as soon as the first result lands.")
+    elif state == "failed":
+        headline, detail = "Failed", (
+            "The run did not finish. See the job log under the spool directory.")
+    elif state == "done":
+        headline, detail = "Finished", "No report was produced for this run."
+    else:
+        headline, detail = "Unknown job", "Nothing in the queue matches that id."
+
+    body = ["<h1>%s</h1>" % html.escape(headline),
+            '<p class="sub">job %s · worker %s</p>'
+            % (html.escape(job_id), html.escape(str(beat.get("state", "unknown")))),
+            '<div class="card"><p class="note">%s</p></div>' % html.escape(detail),
+            '<p class="note"><a href="/">All sessions</a> · '
+            '<a href="/new">Queue another</a></p>']
+    refresh = "3" if state in ("queued", "running") else None
+    return _page("%s — Roundtable" % headline, "\n".join(body), refresh), None
+
+
+def rebuild_session(root, name, sp=None):
+    """Regenerate one session's report.html on demand. -> True if it existed.
+
+    For a session the worker has already finished with (no active job), this
+    is the only way its report ever reflects a newer Roundtable version --
+    the worker only rewrites a report while it owns that job, restarting it
+    doesn't retroactively touch old sessions.
+    """
+    target = _resolve(root, name)
+    if target is None or not os.path.isdir(target):
+        return False
+    data = session_mod.load(target)
+    if not data:
+        return False
+    beat = spool.read_heartbeat(sp) or {}
+    running = (beat.get("state") == "running"
+              and os.path.basename(str(beat.get("session", "")).rstrip("/")) == name)
+    result = consensus.score(data, ranks.extract_all(data))
+    html_out = report.render(data, result, ranks.extract_all(data), running=running)
+    report.write(os.path.join(target, "report.html"), html_out)
+    return True
+
+
+def make_handler(root, sp=None):
+    root = os.path.realpath(root)
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "Roundtable"
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt, *args):          # quiet by default
+            if os.environ.get("ROUNDTABLE_ACCESS_LOG"):
+                super().log_message(fmt, *args)
+
+        def _send(self, code, body, ctype="text/html; charset=utf-8", extra=None):
+            if isinstance(body, str):
+                body = body.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            extra = extra or {}
+            if "Cache-Control" not in extra:
+                # A live report must never be served from cache; static
+                # assets override this explicitly (see _serve_asset).
+                self.send_header("Cache-Control", "no-store")
+            for key, value in extra.items():
+                self.send_header(key, value)
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def _error(self, code, message):
+            self._send(code, "<!doctype html><meta charset=utf-8>"
+                             "<title>%s</title><body style='font:15px system-ui;"
+                             "padding:40px'><h1>%d</h1><p>%s</p>"
+                             "<p><a href='/'>Back to sessions</a></p>"
+                       % (code, code, html.escape(message)))
+
+        def do_HEAD(self):
+            self.do_GET()
+
+        def do_GET(self):
+            path = posixpath.normpath(urllib.parse.urlparse(self.path).path)
+            if path in ("/", "/index.html"):
+                return self._send(200, render_index(root, sp))
+            if path == "/new":
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                notice = query.get("notice", [None])[0]
+                selected = query.get("preset", [None])[0]
+                values = {"preset": selected} if selected else None
+                return self._send(200, render_form(values=values, notice=notice))
+            if path == "/health":
+                return self._send(200, json.dumps({"ok": True}),
+                                  "application/json; charset=utf-8")
+            if path.startswith("/job/"):
+                page, redirect = render_job(path[5:], root, sp)
+                if redirect:
+                    return self._send(302, b"", extra={"Location": redirect})
+                return self._send(200, page)
+            if path.startswith("/rebuild/"):
+                name = path[len("/rebuild/"):].strip("/")
+                if not rebuild_session(root, name, sp):
+                    return self._error(404, "No such session.")
+                return self._send(302, b"", extra={
+                    "Location": "/s/%s/report.html" % urllib.parse.quote(name)})
+            if path.startswith("/s/"):
+                return self._serve_session(path[3:])
+            if path.startswith("/assets/"):
+                return self._serve_asset(path[len("/assets/"):])
+            return self._error(404, "No such page.")
+
+        def _read_form(self):
+            """-> parse_qs()-style multi-dict, or None if the body was rejected
+            (an error has already been sent)."""
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                self._error(400, "Bad Content-Length.")
+                return None
+            if length > 4 * 1024 * 1024:          # prompts, not file uploads
+                self._error(413, "That request is too large.")
+                return None
+            raw = self.rfile.read(length).decode("utf-8", "replace")
+            return urllib.parse.parse_qs(raw, keep_blank_values=True)
+
+        def _json(self, code, payload):
+            self._send(code, json.dumps(payload), "application/json; charset=utf-8")
+
+        def do_POST(self):
+            path = posixpath.normpath(urllib.parse.urlparse(self.path).path)
+            if path == "/submit":
+                return self._do_submit()
+            if path == "/presets/save":
+                return self._do_preset_save()
+            if path == "/presets/delete":
+                return self._do_preset_delete()
+            if path == "/presets/reset":
+                return self._do_preset_reset()
+            return self._error(404, "No such endpoint.")
+
+        def _do_submit(self):
+            parsed = self._read_form()
+            if parsed is None:
+                return
+            fields = {k: v[-1] for k, v in parsed.items()}
+            fields["think_on"] = parsed.get("think_on", [])
+            fields["think_off"] = parsed.get("think_off", [])
+
+            job, error = job_from_form(fields)
+            if error:
+                # Hand the form back with what they typed still in it.
+                return self._send(400, render_form(error=error, values=fields))
+            job_id = spool.submit(job, sp)
+            # 303: the browser must follow with GET, not repeat the POST.
+            return self._send(303, b"", extra={"Location": "/job/%s"
+                                               % urllib.parse.quote(job_id)})
+
+        def _do_preset_save(self):
+            parsed = self._read_form()
+            if parsed is None:
+                return
+            fields = {k: v[-1] for k, v in parsed.items()}
+            try:
+                preset, overwrote_bundled = presets_mod.save(
+                    fields.get("title", ""), fields.get("system_prompt", ""),
+                    fields.get("expects", ""), preset_id=fields.get("id") or None)
+            except ValueError as exc:
+                return self._json(400, {"ok": False, "error": str(exc)})
+            return self._json(200, {"ok": True, "id": preset["id"],
+                                    "title": preset["title"],
+                                    "overwrote_bundled": overwrote_bundled})
+
+        def _do_preset_delete(self):
+            parsed = self._read_form()
+            if parsed is None:
+                return
+            preset_id = (parsed.get("id") or [""])[0]
+            if not preset_id:
+                return self._json(400, {"ok": False, "error": "no preset id given"})
+            was_bundled = preset_id in presets_mod.bundled_ids()
+            deleted = presets_mod.delete(preset_id)
+            return self._json(200, {"ok": True, "deleted": deleted,
+                                    "reverted": deleted and was_bundled})
+
+        def _do_preset_reset(self):
+            presets_mod.reset()
+            return self._json(200, {"ok": True})
+
+        def _serve_session(self, rel):
+            target = _resolve(root, rel)
+            if target is None:
+                return self._error(403, "That path is outside the sessions directory.")
+            if os.path.isdir(target):
+                index = os.path.join(target, "report.html")
+                if os.path.exists(index):
+                    return self._send(302, b"", extra={
+                        "Location": "/s/%s/report.html"
+                                    % urllib.parse.quote(rel.strip("/"))})
+                return self._error(404, "That session has no report yet.")
+            if not os.path.isfile(target):
+                return self._error(404, "No such file.")
+            ctype = mimetypes.guess_type(target)[0] or "application/octet-stream"
+            if ctype.startswith("text/") or ctype == "application/json":
+                ctype += "; charset=utf-8"
+            try:
+                with open(target, "rb") as f:
+                    return self._send(200, f.read(), ctype)
+            except OSError as exc:
+                return self._error(500, "Could not read that file: %s" % exc)
+
+        def _serve_asset(self, name):
+            """Logo/favicon files bundled with the package -- static, so a
+            long cache lifetime is fine; there's no way for the browser to
+            hold a stale one past a Roundtable upgrade that changes the path.
+            """
+            target = _resolve(ASSETS_DIR, name)
+            if target is None or not os.path.isfile(target):
+                return self._error(404, "No such asset.")
+            ctype = mimetypes.guess_type(target)[0] or "application/octet-stream"
+            try:
+                with open(target, "rb") as f:
+                    return self._send(200, f.read(), ctype,
+                                      extra={"Cache-Control": "public, max-age=86400"})
+            except OSError as exc:
+                return self._error(500, "Could not read that file: %s" % exc)
+
+    return Handler
+
+
+def serve(root=None, host=DEFAULT_HOST, port=DEFAULT_PORT, sp=None, log=print,
+          open_browser=False):
+    """Run the server until interrupted. -> None.
+
+    ``open_browser`` is off by default because this same function backs the
+    systemd service (no display to open anything on) as well as interactive
+    use -- only the CLI's interactive entry points turn it on.
+    """
+    root = os.path.realpath(root or session_mod.__dict__.get(
+        "DEFAULT_SESSIONS", os.path.expanduser("~/Apps/creative-bench")))
+    os.makedirs(root, exist_ok=True)
+    httpd = ThreadingHTTPServer((host, port), make_handler(root, sp))
+    httpd.daemon_threads = True
+    url = "http://%s:%d/" % (host, httpd.server_address[1])
+    log("serving %s at %s" % (root, url))
+    if open_browser:
+        import webbrowser
+        try:
+            if not webbrowser.open(url):
+                log("could not open a browser automatically — visit %s" % url)
+        except Exception as exc:
+            log("could not open a browser automatically (%s) — visit %s" % (exc, url))
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        log("stopped")
+    finally:
+        httpd.server_close()

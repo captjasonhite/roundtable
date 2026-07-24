@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+# Bench sessions and generated reports live outside the repo; never commit them.
+sessions/
+report.html
+*.tmp-*
