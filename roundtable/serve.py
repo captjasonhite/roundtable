@@ -639,17 +639,24 @@ def job_from_form(fields, models_root=None):
     if not patterns:
         return None, "Pick at least one model, or give a pattern to match."
 
-    try:
-        temperature = float(fields.get("temperature") or 1.0)
-    except ValueError:
-        return None, "Temperature must be a number."
-    if not 0 <= temperature <= 2:
-        return None, "Temperature must be between 0 and 2."
+    # No temperature field on the page any more -- it's set per model-family
+    # on the sampler cards instead. Left parseable here (and still checked
+    # against 0-2) for scripted job submissions that do send one; the worker
+    # only forwards --temp when this is present (see worker.build_command),
+    # so leaving it out lets each run's card supply its own temperature.
+    temperature = None
+    temp_raw = (fields.get("temperature") or "").strip()
+    if temp_raw:
+        try:
+            temperature = float(temp_raw)
+        except ValueError:
+            return None, "Temperature must be a number."
+        if not 0 <= temperature <= 2:
+            return None, "Temperature must be between 0 and 2."
 
     job = {
         "system_prompt": (fields.get("system_prompt") or "").strip(),
         "user_prompt": user_prompt,
-        "temperature": temperature,
         "mode": mode,
         "models": patterns,
         "summarize": bool(fields.get("summarize")),
@@ -657,6 +664,8 @@ def job_from_form(fields, models_root=None):
         "blind": True,
         "preset": fields.get("preset") or None,
     }
+    if temperature is not None:
+        job["temperature"] = temperature
     seed = (fields.get("seed") or "").strip()
     if seed:
         if not seed.isdigit():

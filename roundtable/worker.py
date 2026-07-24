@@ -87,9 +87,14 @@ def build_command(job, runner=None, prompt_dir=None):
     argv = [runner,
             "--system", sys_path,
             "--user", usr_path,
-            "--temp", str(job.get("temperature", 1.0)),
             "--mode", job.get("mode", "thinking"),
             "--yes"]
+    # Omitted rather than defaulted to 1.0: passing --temp at all sets
+    # creative-bench.sh's TEMP_USER_SET, which makes every model ignore its
+    # sampler card's temperature. Leaving it out when the job didn't ask for
+    # a specific temperature is what lets each run's card supply its own.
+    if job.get("temperature") is not None:
+        argv += ["--temp", str(job["temperature"])]
     models = job.get("models") or []
     if models:
         argv += ["--models", ",".join(models)]
