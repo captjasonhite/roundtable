@@ -42,14 +42,36 @@ class PickTopTests(unittest.TestCase):
 
 class BuildTests(unittest.TestCase):
 
-    def test_prompt_contains_computed_numbers_not_raw_verdicts(self):
+    def test_prompt_states_the_order_without_statistics_jargon(self):
         session, result = scored_session()
         system_prompt, user_prompt = digest.build(session, result)
         self.assertIsNotNone(system_prompt)
         self.assertIn("alpha-7B", user_prompt)
-        self.assertIn("Kendall", user_prompt)
+        # The synthesis is about the writing, not the coefficient — the metric
+        # must not surface by name, and the model is told to drop statistics.
+        self.assertNotIn("Kendall", user_prompt)
+        self.assertIn("without statistics", system_prompt)
         # It must not instruct the model to re-derive a ranking.
         self.assertIn("Do not re-rank", user_prompt)
+
+    def test_includes_judge_notes_on_winner_and_loser_by_name(self):
+        session, result = scored_session()
+        # Judges refer to entries by blind letter; A won, C is last here.
+        session["judges"] = [
+            {"judge": "alpha-7B", "body": "## Output\n\n"
+             "**{{A}}** nails the structure and finishes cleanly.\n\n"
+             "**{{C}}** rambles and never lands the ending."},
+            {"judge": "beta-7B", "body": "## Output\n\n"
+             "**{{A}}** has the sharpest, most disciplined prose here.\n\n"
+             "**{{C}}** repeats a whole paragraph verbatim."},
+        ]
+        _, user_prompt = digest.build(session, result)
+        # Letters are resolved to model names, and both ends are quoted.
+        self.assertNotIn("{{A}}", user_prompt)
+        self.assertIn("finishes cleanly", user_prompt)
+        self.assertIn("repeats a whole paragraph", user_prompt)
+        self.assertIn("top entry (alpha-7B)", user_prompt)
+        self.assertIn("lowest-rated entry (gamma-7B)", user_prompt)
 
     def test_uses_short_names(self):
         session = {"blind": True, "key": {
