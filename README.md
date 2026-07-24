@@ -150,9 +150,33 @@ Then queue five configurations, close the browser, and come back to five
 finished reports. The web page never drives a run — it's a window onto a file the
 worker keeps rewriting.
 
+## The bench runner
+
+The actual model-loading and GPU work is a separate bash script,
+`bin/creative-bench.sh` — bundled in this repo, so a fresh clone works out of
+the box. It's the only piece here that isn't pure Python: it drives
+`llama-server` directly (load a model, send one prompt, save the result, unload,
+repeat), and Roundtable's worker only ever shells out to it with flags. No
+benchmarking logic is duplicated in Python.
+
+It expects:
+
+```sh
+LLAMA_BIN="$HOME/Apps/llama.cpp-src/build/bin/llama-server"   # a built llama-server
+LM_MODELS="$HOME/.lmstudio/models"                            # a directory of *.gguf files
+```
+
+Override either as an environment variable if yours live elsewhere. Run
+`bin/creative-bench.sh --help` for the rest of its flags and knobs — Roundtable
+uses `--system`, `--user`, `--models "pattern:mode,..."`, `--meta-summary`, and
+a handful of others, all documented there.
+
+If you already maintain your own copy elsewhere, point `ROUNDTABLE_RUNNER` at
+it and Roundtable uses that instead of the bundled one.
+
 ## Reading a session directory
 
-Roundtable reads what [`creative-bench.sh`](#the-bench-runner) leaves on disk:
+Roundtable reads what `creative-bench.sh` leaves on disk:
 
 ```
 20260723-211143/

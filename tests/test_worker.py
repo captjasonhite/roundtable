@@ -10,6 +10,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -28,6 +29,36 @@ def render(session_dir, running):
     result = consensus.score(data, rankings)
     html = report.render(data, result, rankings, running=running)
     return report.write(os.path.join(session_dir, "report.html"), html)
+
+
+class DefaultRunnerTests(unittest.TestCase):
+    """Which creative-bench.sh gets used when nothing explicit is passed."""
+
+    def setUp(self):
+        self._old_env = os.environ.get("ROUNDTABLE_RUNNER")
+        os.environ.pop("ROUNDTABLE_RUNNER", None)
+
+    def tearDown(self):
+        if self._old_env is None:
+            os.environ.pop("ROUNDTABLE_RUNNER", None)
+        else:
+            os.environ["ROUNDTABLE_RUNNER"] = self._old_env
+
+    def test_env_override_always_wins(self):
+        os.environ["ROUNDTABLE_RUNNER"] = "/custom/path.sh"
+        self.assertEqual(worker._default_runner(), "/custom/path.sh")
+
+    def test_falls_back_to_the_bundled_copy_when_no_personal_one_exists(self):
+        with mock.patch("os.path.exists", return_value=False):
+            got = worker._default_runner()
+        self.assertEqual(got, worker._BUNDLED_RUNNER)
+        self.assertTrue(os.path.exists(worker._BUNDLED_RUNNER),
+                        "the bundled copy this falls back to must actually exist")
+
+    def test_prefers_a_personal_copy_over_the_bundled_one(self):
+        with mock.patch("os.path.exists", return_value=True):
+            got = worker._default_runner()
+        self.assertEqual(got, os.path.expanduser("~/Apps/bin/creative-bench.sh"))
 
 
 class BuildCommandTests(unittest.TestCase):

@@ -18,8 +18,29 @@ import time
 
 from . import consensus, digest, ranks, session as session_mod, spool
 
-DEFAULT_RUNNER = os.environ.get(
-    "ROUNDTABLE_RUNNER", os.path.expanduser("~/Apps/bin/creative-bench.sh"))
+_BUNDLED_RUNNER = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin",
+    "creative-bench.sh")
+
+
+def _default_runner():
+    """Which creative-bench.sh to shell out to, absent an explicit override.
+
+    ``ROUNDTABLE_RUNNER`` always wins. Otherwise: a separately-maintained
+    ``~/Apps/bin/creative-bench.sh`` wins over the repo's own bundled copy --
+    if you keep editing your own script there, the worker should pick up
+    those edits rather than silently running a frozen snapshot. Only a fresh
+    clone with no such personal copy falls back to the bundled one, which is
+    what makes the repo work for someone who just cloned it.
+    """
+    override = os.environ.get("ROUNDTABLE_RUNNER")
+    if override:
+        return override
+    personal = os.path.expanduser("~/Apps/bin/creative-bench.sh")
+    return personal if os.path.exists(personal) else _BUNDLED_RUNNER
+
+
+DEFAULT_RUNNER = _default_runner()
 DEFAULT_SESSIONS = os.environ.get(
     "ROUNDTABLE_SESSIONS", os.path.expanduser("~/Apps/creative-bench"))
 
