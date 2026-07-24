@@ -17,8 +17,9 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import consensus, ranks
+from . import benchmarks, consensus, ranks
 from . import models as models_mod
+from . import model_cards as model_cards_mod
 from . import presets as presets_mod
 from . import report, session as session_mod, spool
 
@@ -98,6 +99,21 @@ button.ghost{background:none;color:var(--series);border:1px solid var(--border);
   margin-left:auto}
 .preset-actions a:hover{color:var(--series)}
 .preset-actions .hint{width:100%;margin:0}
+.mc-card{border:1px solid var(--border);border-radius:8px;padding:12px 14px;
+  margin:0 0 12px}
+.mc-card:last-child{margin-bottom:0}
+.mc-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.mc-head b{font-size:14.5px}
+.mc-head .hint{margin:0}
+.mc-hist{font-size:12.5px;color:var(--muted);margin:4px 0 0}
+.mc-profiles{display:flex;gap:16px;flex-wrap:wrap;margin:10px 0 0}
+.mc-profile{flex:1;min-width:260px}
+.mc-profile>div{font-size:11.5px;text-transform:uppercase;letter-spacing:.05em;
+  color:var(--muted);margin:0 0 6px}
+.mc-fields{display:grid;grid-template-columns:repeat(6,1fr);gap:8px}
+.mc-fields label{display:block;font-size:11px;font-weight:400;color:var(--muted);
+  margin:0 0 3px}
+.mc-fields input{padding:6px 7px;font-size:13px}
 """
 
 
@@ -213,12 +229,150 @@ def _page(title, body, refresh=None):
     return "\n".join(parts + [body]) + "\n</div></body></html>\n"
 
 
-def render_form(error=None, values=None, models_root=None, presets=None, notice=None):
+def _card_norm(text):
+    return "".join(c for c in (text or "").lower() if c.isalnum())
+
+
+def _history_for_card(card, history):
+    """-> {mode: entry} of history rows whose profile text names this card.
+
+    History is keyed by the free-text ``sampler_profile`` string written into
+    each run's frontmatter (see benchmarks.py), not by card id, so this
+    matches loosely: the card's title, normalised, has to appear in the
+    profile text. "thinking" vs the rest sorts a two-profile card's rows
+    under the right column; a card with one shared profile gets everything
+    under "thinking".
+    """
+    needle = _card_norm(card.get("title") or card["id"])
+    out = {}
+    for profile, entry in history.items():
+        if needle and needle in _card_norm(profile):
+            mode = "thinking" if "thinking" in profile.lower() else "nothinking"
+            out[mode] = entry
+    return out
+
+
+_FIELD_LABELS = (("temp", "Temp"), ("top_p", "Top-p"), ("top_k", "Top-k"),
+                 ("min_p", "Min-p"), ("repeat", "Repeat"), ("presence", "Presence"))
+
+
+def _mc_fields(card_id, mode, profile):
+    parts = ['<div class="mc-fields">']
+    for key, label in _FIELD_LABELS:
+        value = profile.get(key)
+        parts.append('<label>%s <input type="number" step="any" class="mc-field" '
+                     'data-card="%s" data-mode="%s" data-key="%s" value="%s">'
+                     '</label>'
+                     % (label, html.escape(card_id), mode, key,
+                        "" if value is None else html.escape(str(value))))
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def _mc_hist_line(entry):
+    if not entry:
+        return '<p class="mc-hist">No scored runs recorded yet.</p>'
+    return ('<p class="mc-hist">mean percentile %.2f over %d run(s), '
+           '%d session(s) &middot; last %s</p>'
+           % (entry["mean_score"], entry["runs"], entry["sessions"],
+              html.escape(entry["last_session"])))
+
+
+def _render_model_cards(cards, history):
+    if not cards:
+        return ""
+    parts = ['<div class="card"><h2 style="margin-top:0">Model sampler settings</h2>',
+            '<p class="sub" style="margin-top:-4px">Per-family sampler values pulled '
+            'from each model&rsquo;s HuggingFace card. Edited here, they apply to the '
+            'next bench run that matches — see <code>--no-card-settings</code> to '
+            'bypass them for a controlled run.</p>']
+    for card in cards:
+        same = card["thinking"] == card["nothinking"]
+        hist = _history_for_card(card, history)
+        parts.append('<div class="mc-card" data-card-id="%s" data-mirror="%s">'
+                     % (html.escape(card["id"]), "1" if same else "0"))
+        parts.append('<div class="mc-head"><b>%s</b><span class="hint">%s</span></div>'
+                     % (html.escape(card.get("title", card["id"])),
+                        html.escape(card.get("source", ""))))
+        if card.get("note"):
+            parts.append('<p class="hint">%s</p>' % html.escape(card["note"]))
+        parts.append('<div class="mc-profiles">')
+        parts.append('<div class="mc-profile"><div>%s</div>%s%s</div>'
+                     % ("Sampler settings" if same else "Thinking",
+                        _mc_fields(card["id"], "thinking", card["thinking"]),
+                        _mc_hist_line(hist.get("thinking") or hist.get("nothinking"))))
+        if not same:
+            parts.append('<div class="mc-profile"><div>No thinking</div>%s%s</div>'
+                         % (_mc_fields(card["id"], "nothinking", card["nothinking"]),
+                            _mc_hist_line(hist.get("nothinking"))))
+        parts.append("</div>")
+        parts.append('<div class="preset-actions" style="margin-top:10px">'
+                     '<button type="button" class="mc-save" data-card-id="%s">Save</button>'
+                     '<button type="button" class="mc-reset" data-card-id="%s">'
+                     'Reset to card default</button>'
+                     '<span class="mc-status hint"></span></div>'
+                     % (html.escape(card["id"]), html.escape(card["id"])))
+        parts.append("</div>")
+    parts.append("</div>")
+    parts.append("""<script>
+(function () {
+  document.querySelectorAll('.mc-save').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var id = btn.dataset.cardId;
+      var cardEl = btn.closest('.mc-card');
+      var thinking = {}, nothinking = {};
+      cardEl.querySelectorAll('.mc-field[data-mode="thinking"]').forEach(function (inp) {
+        thinking[inp.dataset.key] = inp.value === '' ? null : parseFloat(inp.value);
+      });
+      if (cardEl.dataset.mirror === '1') {
+        nothinking = thinking;
+      } else {
+        cardEl.querySelectorAll('.mc-field[data-mode="nothinking"]').forEach(function (inp) {
+          nothinking[inp.dataset.key] = inp.value === '' ? null : parseFloat(inp.value);
+        });
+      }
+      var status = cardEl.querySelector('.mc-status');
+      fetch('/model-cards/save', {method: 'POST', body: new URLSearchParams({
+        id: id, thinking: JSON.stringify(thinking), nothinking: JSON.stringify(nothinking)
+      })})
+        .then(function (r) { return r.json().then(function (d) { return [r.ok, d]; }); })
+        .then(function (pair) {
+          var ok = pair[0], data = pair[1];
+          status.textContent = ok ? 'Saved.' : (data.error || 'Could not save.');
+          status.style.color = ok ? 'var(--muted)' : 'var(--pos)';
+        })
+        .catch(function () {
+          status.textContent = 'Could not reach the server.';
+          status.style.color = 'var(--pos)';
+        });
+    });
+  });
+  document.querySelectorAll('.mc-reset').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      if (!confirm('Reset this card to its bundled default?')) { return; }
+      fetch('/model-cards/reset', {method: 'POST',
+        body: new URLSearchParams({id: btn.dataset.cardId})})
+        .then(function () { location.reload(); })
+        .catch(function () {
+          btn.closest('.mc-card').querySelector('.mc-status').textContent =
+            'Could not reach the server.';
+        });
+    });
+  });
+})();
+</script>""")
+    return "\n".join(parts)
+
+
+def render_form(error=None, values=None, models_root=None, presets=None, notice=None,
+                cards=None, history=None):
     """The submit form: pick a role, write a prompt, tick some models."""
     values = values or {}
     presets = presets if presets is not None else presets_mod.load()
     found = models_mod.discover(models_root)
     bundled_ids = presets_mod.bundled_ids()
+    cards = cards if cards is not None else model_cards_mod.load()
+    history = history if history is not None else benchmarks.load_history()
 
     def val(key, default=""):
         return html.escape(str(values.get(key, default)))
@@ -358,6 +512,8 @@ def render_form(error=None, values=None, models_root=None, presets=None, notice=
                 'padding:11px 18px;border-radius:8px;border:1px solid var(--border);'
                 'color:var(--series)">Cancel</a></div>')
     body.append("</div></form>")
+
+    body.append(_render_model_cards(cards, history))
 
     # The dropdown fills the system prompt and shows what the Prompt box wants.
     lookup = {p["id"]: {"title": p["title"], "system_prompt": p["system_prompt"],
@@ -696,6 +852,10 @@ def make_handler(root, sp=None):
                 return self._do_preset_delete()
             if path == "/presets/reset":
                 return self._do_preset_reset()
+            if path == "/model-cards/save":
+                return self._do_model_card_save()
+            if path == "/model-cards/reset":
+                return self._do_model_card_reset()
             return self._error(404, "No such endpoint.")
 
         def _do_submit(self):
@@ -745,6 +905,33 @@ def make_handler(root, sp=None):
         def _do_preset_reset(self):
             presets_mod.reset()
             return self._json(200, {"ok": True})
+
+        def _do_model_card_save(self):
+            parsed = self._read_form()
+            if parsed is None:
+                return
+            fields = {k: v[-1] for k, v in parsed.items()}
+            card_id = fields.get("id", "")
+            try:
+                thinking = json.loads(fields.get("thinking") or "{}")
+                nothinking = json.loads(fields.get("nothinking") or "{}")
+            except ValueError:
+                return self._json(400, {"ok": False, "error": "malformed settings"})
+            try:
+                card = model_cards_mod.save(card_id, thinking, nothinking)
+            except ValueError as exc:
+                return self._json(400, {"ok": False, "error": str(exc)})
+            return self._json(200, {"ok": True, "id": card["id"]})
+
+        def _do_model_card_reset(self):
+            parsed = self._read_form()
+            if parsed is None:
+                return
+            card_id = (parsed.get("id") or [""])[0]
+            if not card_id:
+                return self._json(400, {"ok": False, "error": "no card id given"})
+            reverted = model_cards_mod.reset(card_id)
+            return self._json(200, {"ok": True, "reverted": reverted})
 
         def _serve_session(self, rel):
             target = _resolve(root, rel)

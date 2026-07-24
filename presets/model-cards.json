@@ -1,0 +1,44 @@
+{
+  "cards": [
+    {
+      "id": "gemma4",
+      "match": "gemma4",
+      "title": "Gemma4",
+      "thinks": true,
+      "source": "HauhauCS card, verified 2026-07-23",
+      "note": "One profile only — the card says nothing about thinking vs not.",
+      "thinking": {"temp": 0.6, "top_p": 0.9, "top_k": 64, "min_p": 0.05, "repeat": 1.1, "presence": 0},
+      "nothinking": {"temp": 0.6, "top_p": 0.9, "top_k": 64, "min_p": 0.05, "repeat": 1.1, "presence": 0}
+    },
+    {
+      "id": "apex",
+      "match": "apex",
+      "title": "APEX",
+      "thinks": true,
+      "source": "SC117 card, verified 2026-07-23",
+      "note": "Its thinking profile asks for presence_penalty 1.5, unlike the other two Qwen cards which ask for 0 — following each card as written.",
+      "thinking": {"temp": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "repeat": 1.0, "presence": 1.5},
+      "nothinking": {"temp": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0, "repeat": 1.0, "presence": 1.5}
+    },
+    {
+      "id": "qwen3.6",
+      "match": ["heretic-v2", "fable-fus"],
+      "title": "Qwen3.6 (heretic-v2 / Fable-Fus)",
+      "thinks": true,
+      "source": "llmfan46 + DavidAU cards, verified 2026-07-23",
+      "note": "Same Qwen3.6 base guidance. DavidAU adds, for MTP quants: keep temp <= 1 and repeat-penalty at 1.0 (off) — do not \"fix\" repetition here by raising it. Instruct profile is inferred for Fable, whose card only documents thinking.",
+      "thinking": {"temp": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "repeat": 1.0, "presence": 0},
+      "nothinking": {"temp": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0, "repeat": 1.0, "presence": 1.5}
+    },
+    {
+      "id": "cydonia",
+      "match": "cydonia",
+      "title": "Cydonia",
+      "thinks": false,
+      "source": "Jason's settings, 2026-07-23",
+      "note": "TheDrummer publishes no sampler settings for Cydonia — the card gives only the Mistral v7 Tekken template and \"thinking works, no thinking also works\". Unset knobs (top_p, top_k, presence) keep the script default.",
+      "thinking": {"temp": 1.0, "top_p": null, "top_k": null, "min_p": 0.03, "repeat": 1.0, "presence": null},
+      "nothinking": {"temp": 1.0, "top_p": null, "top_k": null, "min_p": 0.03, "repeat": 1.0, "presence": null}
+    }
+  ]
+}

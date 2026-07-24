@@ -127,52 +127,53 @@ REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-3600}"
 # CARD_SETTINGS=0 (or --no-card-settings) turns this off for a controlled run
 # where every model gets identical samplers. Anything pinned via env/--temp always
 # wins over the card.
+#
+# The settings themselves live in presets/model-cards.json (bundled) merged
+# with ~/.config/roundtable/model-cards.json (edited on the roundtable web
+# page's "New run" form) -- not hardcoded here -- so editing a card on the page
+# changes what the next bench run actually uses. See roundtable/model_cards.py.
 CARD_SETTINGS="${CARD_SETTINGS:-1}"
+ROUNDTABLE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 card_settings() {  # card_settings <model-path> <thinking|nothinking>
-  # sets C_TEMP C_TOP_P C_TOP_K C_MIN_P C_REP C_PRES C_PROFILE
+  # sets C_TEMP C_TOP_P C_TOP_K C_MIN_P C_REP C_PRES C_PROFILE C_THINKS
   local m="${1,,}" mode="$2"
   C_TEMP=""; C_TOP_P=""; C_TOP_K=""; C_MIN_P=""; C_REP=""; C_PRES=""
   C_PROFILE="script defaults (no published card settings)"
-  # C_THINKS=0 means the model has no template-level reasoning mode, so running it
-  # twice (thinking + nothinking) burns a load to produce the same text twice.
   C_THINKS=1
-  [[ "$m" == *cydonia* ]] && C_THINKS=0
+  local out
+  out="$(PYTHONPATH="$ROUNDTABLE_ROOT" python3 -c '
+import shlex, sys
+from roundtable import model_cards
 
-  if [[ "$m" == *gemma4* ]]; then
-    # HauhauCS card: temp 0.6, top_k 64, top_p 0.9, min_p 0.05, repeat 1.1.
-    # One profile only — the card says nothing about thinking vs not.
-    C_TEMP=0.6; C_TOP_P=0.9; C_TOP_K=64; C_MIN_P=0.05; C_REP=1.1; C_PRES=0
-    C_PROFILE="Gemma4 card"
-  elif [[ "$m" == *apex* ]]; then
-    # SC117 card. NOTE its thinking profile asks for presence_penalty 1.5, unlike
-    # the other two Qwen cards which ask for 0 — following each card as written.
-    if [[ "$mode" == thinking ]]; then
-      C_TEMP=1.0; C_TOP_P=0.95; C_TOP_K=20; C_MIN_P=0.0; C_REP=1.0; C_PRES=1.5
-      C_PROFILE="APEX card / thinking-general"
-    else
-      C_TEMP=0.7; C_TOP_P=0.8;  C_TOP_K=20; C_MIN_P=0.0; C_REP=1.0; C_PRES=1.5
-      C_PROFILE="APEX card / instruct-general"
-    fi
-  elif [[ "$m" == *heretic-v2* || "$m" == *fable-fus* ]]; then
-    # llmfan46 + DavidAU cards (same Qwen3.6 base guidance).
-    # DavidAU adds, for MTP quants: keep temp <= 1 and REP PEN AT 1.0 (off) —
-    # so do not "fix" repetition here by raising repeat-penalty.
-    if [[ "$mode" == thinking ]]; then
-      C_TEMP=1.0; C_TOP_P=0.95; C_TOP_K=20; C_MIN_P=0.0; C_REP=1.0; C_PRES=0
-      C_PROFILE="Qwen3.6 card / thinking-general"
-    else
-      C_TEMP=0.7; C_TOP_P=0.8;  C_TOP_K=20; C_MIN_P=0.0; C_REP=1.0; C_PRES=1.5
-      C_PROFILE="Qwen3.6 card / instruct-general (inferred for Fable: its card only documents thinking)"
-    fi
-  elif [[ "$m" == *cydonia* ]]; then
-    # TheDrummer publishes no sampler settings for Cydonia — the card gives only
-    # the Mistral v7 Tekken template and "thinking works, no thinking also works".
-    # These are Jason's, supplied 2026-07-23. Unset knobs keep the script default.
-    C_TEMP=1.0; C_MIN_P=0.03; C_REP=1.0
-    C_PROFILE="Cydonia / Jason's settings"
-  fi
-  # Anything else: no published sampler settings, keep the script defaults.
+name, mode = sys.argv[1], sys.argv[2]
+card = model_cards.match(name)
+if not card:
+    sys.exit(0)
+
+profile = card["thinking"] if mode == "thinking" else card["nothinking"]
+
+
+def emit(key, value):
+    print("%s=%s" % (key, "" if value is None else value))
+
+
+emit("C_TEMP", profile.get("temp"))
+emit("C_TOP_P", profile.get("top_p"))
+emit("C_TOP_K", profile.get("top_k"))
+emit("C_MIN_P", profile.get("min_p"))
+emit("C_REP", profile.get("repeat"))
+emit("C_PRES", profile.get("presence"))
+print("C_THINKS=%d" % (1 if card.get("thinks", True) else 0))
+
+label = card.get("title", card["id"])
+same = card["thinking"] == card["nothinking"]
+text = ("%s card" % label if same
+        else "%s card / %s" % (label, "thinking-general" if mode == "thinking"
+                                else "instruct-general"))
+print("C_PROFILE=%s" % shlex.quote(text))
+' "$m" "$mode")"
+  [[ -n "$out" ]] && eval "$out"
 }
 
 # --- summary pass -----------------------------------------------------------

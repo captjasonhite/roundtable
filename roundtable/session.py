@@ -105,6 +105,7 @@ def read_runs(sdir, key):
             "temperature": meta.get("temperature", ""),
             "seed": meta.get("seed", ""),
             "samplers": meta.get("samplers", ""),
+            "sampler_profile": meta.get("sampler_profile", ""),
             "error": None if err in (None, "null", "") else err,
             "body": body,
         })

@@ -7,6 +7,7 @@
     roundtable work                            run queued jobs, one at a time
     roundtable up                              serve the form + run the worker (the app)
     roundtable serve                           serve the form and reports only
+    roundtable benchmarks                      roll up scores.json by sampler profile
     roundtable status                          queue depth and what the worker is doing
 
 Reports are written to <session>/report.html, atomically, so a browser reloading
@@ -20,7 +21,7 @@ import sys
 # realpath, not abspath: this is meant to be symlinked onto PATH.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
-from roundtable import consensus, ranks, report, session as session_mod
+from roundtable import benchmarks, consensus, ranks, report, session as session_mod
 from roundtable import serve, spool, worker
 
 DEFAULT_ROOT = os.environ.get(
@@ -52,6 +53,7 @@ def build(sdir, out_path=None, running=False, refresh=15, quiet=False,
                          include_prompts=include_prompts)
     path = out_path or os.path.join(data["dir"], "report.html")
     report.write(path, html)
+    benchmarks.write_session_scores(data["dir"], data=data, result=result)
     if not quiet:
         parsed = sum(1 for r in rankings if r["ranks"])
         print("  %-22s %2d runs · %d/%d verdicts read · %s"
@@ -145,6 +147,21 @@ def cmd_up(args):
     return 0
 
 
+def cmd_benchmarks(args):
+    root = _sessions_root(args)
+    history = benchmarks.aggregate(root, spool_dir=args.spool)
+    if not history:
+        print("no scored sessions found under %s -- run "
+              "'roundtable report --all %s' first" % (root, root))
+        return 1
+    for profile, entry in sorted(history.items(), key=lambda kv: -kv[1]["mean_score"]):
+        print("%-55s mean %.2f · %d run(s) across %d session(s) · last %s"
+              % (profile, entry["mean_score"], entry["runs"], entry["sessions"],
+                 entry["last_session"]))
+    print("\nwritten to %s" % benchmarks.history_path(args.spool))
+    return 0
+
+
 def cmd_status(args):
     counts = spool.counts(args.spool)
     print("queue %(queue)d · running %(running)d · done %(done)d · failed %(failed)d"
@@ -224,6 +241,11 @@ def main(argv=None):
             c.set_defaults(func=cmd_up)
         else:
             c.set_defaults(func=cmd_serve)
+
+    b = subs.add_parser("benchmarks", help="roll up scores.json by sampler profile")
+    b.add_argument("--sessions", help="sessions root (default %s)" % DEFAULT_ROOT)
+    b.add_argument("--spool", help="spool directory (default %s)" % spool.DEFAULT_SPOOL)
+    b.set_defaults(func=cmd_benchmarks)
 
     st = subs.add_parser("status", help="queue depth and worker state")
     st.add_argument("--spool", help="spool directory (default %s)" % spool.DEFAULT_SPOOL)
