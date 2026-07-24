@@ -1,8 +1,9 @@
 """Render one session as a self-contained HTML report.
 
-No JavaScript, no network requests, no build step: the output is a single file
-you can open with file:// or serve from anywhere. Charts are hand-written SVG
-and CSS so the report has no dependencies at all.
+No network requests, no build step: the output is a single file you can open
+with file:// or serve from anywhere. Charts are hand-written SVG and CSS so
+the report has no external dependencies. The only JavaScript is the copy-to-
+clipboard button on each expandable section.
 
 While a session is still running the report is regenerated after every run and
 carries a <meta refresh>, so the browser polls by simply reloading. The final
@@ -56,7 +57,7 @@ h2{font-size:16px;margin:38px 0 6px;letter-spacing:-.005em}
 .round3{border:1px solid var(--border);border-radius:10px;padding:20px 22px;
   margin:0 0 18px;background:var(--surface)}
 .round3 .body{white-space:pre-wrap;font-size:14.5px;line-height:1.6;margin-top:10px}
-p.note{color:var(--ink2);margin:4px 0 16px;font-size:13.5px;max-width:70ch}
+p.note{color:var(--ink2);margin:4px 0 16px;font-size:13.5px}
 .sub{color:var(--muted);font-size:13px;margin:0 0 22px}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:10px;
   padding:18px 20px;margin:0 0 18px;overflow-x:auto}
@@ -112,7 +113,13 @@ code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.
 .dbar .val{width:52px;flex:none;text-align:right;color:var(--ink2);
   font-variant-numeric:tabular-nums}
 details{margin:10px 0 0;font-size:13.5px}
-summary{cursor:pointer;color:var(--ink2)}
+summary{cursor:pointer;color:var(--ink2);display:flex;align-items:center;gap:8px}
+summary .sumtext{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.copy-btn{flex:none;font-size:13px;line-height:1;color:var(--ink2);
+  background:var(--page);border:1px solid var(--border);border-radius:5px;
+  padding:4px 6px;cursor:pointer}
+.copy-btn:hover{color:var(--ink);border-color:var(--axis)}
+.copy-btn.copied{color:var(--series);border-color:var(--series)}
 pre{white-space:pre-wrap;background:var(--page);border:1px solid var(--border);
   border-radius:8px;padding:12px;font-size:12.5px;overflow-x:auto;max-height:340px}
 .warn{border-left:3px solid var(--pos);padding-left:12px;margin:0 0 18px}
@@ -120,6 +127,10 @@ footer{color:var(--muted);font-size:12.5px;margin-top:44px;border-top:1px solid 
   padding-top:14px}
 a{color:var(--series)}
 """
+
+
+COPY_BTN = ('<button type="button" class="copy-btn" title="Copy" aria-label="Copy" '
+           'onclick="rtCopy(this,event)">&#10697;</button>')
 
 
 def esc(text):
@@ -155,7 +166,7 @@ def _tiles(session, result, rankings):
     tiles.append(("Judges", str(len(result["judges"])),
                   "%d ranked every output" % result["agreement_n"]))
     if result["agreement"] is not None:
-        tiles.append(("Agreement (W)", C.fmt(result["agreement"]),
+        tiles.append(("Agreement", C.fmt(result["agreement"]),
                       C.agreement_label(result["agreement"])))
     if tps:
         tiles.append(("Median speed", "%.0f" % sorted(tps)[len(tps) // 2], "tok/s"))
@@ -470,8 +481,9 @@ def _outputs_section(session, result):
         title = "%s%s (%s)" % (("%s — " % r["label"]) if r["label"] else "",
                                r["model"], r["mode"])
         open_attr = " open" if r["label"] and r["label"] == winner_label else ""
-        out.append("<details%s><summary>%s</summary><pre>%s</pre></details>"
-                  % (open_attr, esc(title),
+        out.append("<details%s><summary><span class=\"sumtext\">%s</span>%s</summary>"
+                  "<pre>%s</pre></details>"
+                  % (open_attr, esc(title), COPY_BTN,
                      esc(_body_only(r["body"]).strip() or r["error"] or "(empty)")))
     out.append("</div>")
     return "\n".join(out)
@@ -502,8 +514,9 @@ def _verdicts_section(session, result=None, rankings=None):
         d = distance[j["file"]]
         note = (" &middot; avg. %s ranks from consensus" % C.fmt(d, 1)
                if d is not None else "")
-        out.append("<details><summary>%s%s</summary><pre>%s</pre></details>"
-                  % (esc(j["judge"]), note,
+        out.append("<details><summary><span class=\"sumtext\">%s%s</span>%s</summary>"
+                  "<pre>%s</pre></details>"
+                  % (esc(j["judge"]), note, COPY_BTN,
                      esc(j["body"].strip() or j["error"] or "(empty)")))
     out.append("</div>")
     return "\n".join(out)
@@ -515,8 +528,9 @@ def _prompts(session):
                         ("User prompt", session["user_prompt"])):
         if not text.strip():
             continue
-        out.append("<details><summary>%s (%d characters)</summary><pre>%s</pre></details>"
-                   % (esc(title), len(text), esc(text)))
+        out.append("<details><summary><span class=\"sumtext\">%s (%d characters)</span>%s"
+                   "</summary><pre>%s</pre></details>"
+                   % (esc(title), len(text), COPY_BTN, esc(text)))
     out.append("</div>")
     return "\n".join(out)
 
@@ -574,8 +588,8 @@ def render(session, result, rankings, running=False, refresh=15,
     contested = C.disagreements(result, 2)
     notes = []
     if result["agreement"] is not None:
-        notes.append("Agreement is Kendall&rsquo;s W over the %d judges that ranked every "
-                     "output (tie-corrected): %s, %s."
+        notes.append("Agreement measures how closely the %d judges that ranked every "
+                     "output lined up (0 = unrelated, 1 = identical order): %s, %s."
                      % (result["agreement_n"], C.fmt(result["agreement"]),
                         C.agreement_label(result["agreement"])))
     if contested and contested[0]["spread"]:
@@ -587,6 +601,27 @@ def render(session, result, rankings, running=False, refresh=15,
                  "this page; they appear only in the self-preference section.")
     body.append("<footer>%s<br><br>Generated by Roundtable from <code>%s</code>.</footer>"
                 % (" ".join(notes), esc(session["dir"])))
+    body.append("""<script>
+function rtCopy(btn, ev){
+  ev.preventDefault(); ev.stopPropagation();
+  var pre = btn.closest('details').querySelector('pre');
+  var text = pre.textContent;
+  var done = function(){
+    var old = btn.innerHTML;
+    btn.innerHTML = '&#10003;'; btn.classList.add('copied');
+    setTimeout(function(){ btn.innerHTML = old; btn.classList.remove('copied'); }, 1200);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, done);
+  } else {
+    var ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); } catch (e) {}
+    document.body.removeChild(ta); done();
+  }
+}
+</script>""")
 
     return "\n".join(head + body) + "\n</div></body></html>\n"
 

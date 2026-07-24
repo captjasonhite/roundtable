@@ -91,7 +91,7 @@ class ReportRenderTests(unittest.TestCase):
         """With no scored panel there is no 'winner' to expand."""
         self.write("01_x_alpha_thinking.md", RUN)
         _, html = self.render()
-        self.assertIn("<details><summary>alpha-7B", html)
+        self.assertIn('<details><summary><span class="sumtext">alpha-7B', html)
         self.assertNotIn("<details open>", html)
 
     def test_winning_output_is_expanded_by_default(self):
@@ -103,7 +103,7 @@ class ReportRenderTests(unittest.TestCase):
         # Exactly one entry is open, and it's the one the panel ranked first.
         self.assertEqual(html.count("<details open>"), 1)
         winner = html.split("<details open>", 1)[1]
-        self.assertTrue(winner.startswith("<summary>A"))
+        self.assertTrue(winner.startswith('<summary><span class="sumtext">A'))
         self.assertIn("The generated haiku text.", winner.split("</details>", 1)[0])
         self.assertNotIn("A weaker haiku", winner.split("</details>", 1)[0])
 
