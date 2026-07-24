@@ -99,6 +99,7 @@ button.ghost{background:none;color:var(--series);border:1px solid var(--border);
   margin-left:auto}
 .preset-actions a:hover{color:var(--series)}
 .preset-actions .hint{width:100%;margin:0}
+.mc-section{border-top:1px solid var(--grid);padding-top:18px;margin-top:4px}
 .mc-card{border:1px solid var(--border);border-radius:8px;padding:12px 14px;
   margin:0 0 12px}
 .mc-card:last-child{margin-bottom:0}
@@ -281,10 +282,10 @@ def _mc_hist_line(entry):
 def _render_model_cards(cards, history):
     if not cards:
         return ""
-    parts = ['<div class="card"><h2 style="margin-top:0">Model sampler settings</h2>',
-            '<p class="sub" style="margin-top:-4px">Per-family sampler values pulled '
-            'from each model&rsquo;s HuggingFace card. Edited here, they apply to the '
-            'next bench run that matches — see <code>--no-card-settings</code> to '
+    parts = ['<div class="field mc-section"><label>Model sampler settings</label>'
+            '<p class="hint">Per-family sampler values pulled from each '
+            'model&rsquo;s HuggingFace card. Edited here, they apply to the next '
+            'bench run that matches — see <code>--no-card-settings</code> to '
             'bypass them for a controlled run.</p>']
     for card in cards:
         same = card["thinking"] == card["nothinking"]
@@ -474,10 +475,6 @@ def render_form(error=None, values=None, models_root=None, presets=None, notice=
                 % val("extra_models"))
 
     body.append('<div class="grid">')
-    body.append('<div class="field"><label for="temperature">Temperature</label>'
-                '<input type="number" id="temperature" name="temperature" '
-                'step="0.05" min="0" max="2" value="%s"></div>'
-                % val("temperature", "1.0"))
     body.append('<div class="field"><label for="max_tokens">Max tokens</label>'
                 '<input type="number" id="max_tokens" name="max_tokens" min="64" '
                 'step="64" value="%s"></div>' % val("max_tokens", "8192"))
@@ -486,6 +483,8 @@ def render_form(error=None, values=None, models_root=None, presets=None, notice=
                 'placeholder="random"><p class="hint">Shared by every run.</p>'
                 "</div>" % val("seed"))
     body.append("</div>")
+
+    body.append(_render_model_cards(cards, history))
 
     body.append('<div class="field"><label class="check">'
                 '<input type="checkbox" id="summarize" name="summarize" value="1"%s> '
@@ -512,8 +511,6 @@ def render_form(error=None, values=None, models_root=None, presets=None, notice=
                 'padding:11px 18px;border-radius:8px;border:1px solid var(--border);'
                 'color:var(--series)">Cancel</a></div>')
     body.append("</div></form>")
-
-    body.append(_render_model_cards(cards, history))
 
     # The dropdown fills the system prompt and shows what the Prompt box wants.
     lookup = {p["id"]: {"title": p["title"], "system_prompt": p["system_prompt"],
