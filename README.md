@@ -159,14 +159,16 @@ the box. It's the only piece here that isn't pure Python: it drives
 repeat), and Roundtable's worker only ever shells out to it with flags. No
 benchmarking logic is duplicated in Python.
 
-It expects:
+It needs two things:
 
 ```sh
 LLAMA_BIN="$HOME/Apps/llama.cpp-src/build/bin/llama-server"   # a built llama-server
 LM_MODELS="$HOME/.lmstudio/models"                            # a directory of *.gguf files
 ```
 
-Override either as an environment variable if yours live elsewhere. Run
+`llama-server` is found automatically if it's on your `PATH`; otherwise set
+`LLAMA_BIN` to point at it. Set `LM_MODELS` if your `*.gguf` files live somewhere
+other than the LM Studio default. Override either as an environment variable. Run
 `bin/creative-bench.sh --help` for the rest of its flags and knobs — Roundtable
 uses `--system`, `--user`, `--models "pattern:mode,..."`, `--meta-summary`, and
 a handful of others, all documented there.

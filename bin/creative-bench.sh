@@ -60,6 +60,10 @@
 #   PORT=11436            llama-server port (deliberately not code-stack's 11435)
 set -euo pipefail
 
+# llama-server: an explicit $LLAMA_BIN always wins; otherwise prefer one already
+# on PATH (what most people who built llama.cpp will have), and only then fall
+# back to the author's own build location as a last guess.
+LLAMA_BIN="${LLAMA_BIN:-$(command -v llama-server 2>/dev/null || true)}"
 LLAMA_BIN="${LLAMA_BIN:-$HOME/Apps/llama.cpp-src/build/bin/llama-server}"
 LM_MODELS="${LM_MODELS:-$HOME/.lmstudio/models}"
 OUTDIR="${OUTDIR:-$HOME/Apps/creative-bench}"
@@ -215,7 +219,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -x "$LLAMA_BIN" ]] || { echo "llama-server not built — run ~/Apps/setup/build-llama-cpp.sh first" >&2; exit 1; }
+[[ -x "$LLAMA_BIN" ]] || { echo "llama-server not found at: $LLAMA_BIN
+Build llama.cpp (https://github.com/ggml-org/llama.cpp) and either put llama-server
+on your PATH or point LLAMA_BIN at it, e.g. LLAMA_BIN=/path/to/llama-server. See the
+README (\"The bench runner\") for LLAMA_BIN / LM_MODELS." >&2; exit 1; }
 command -v python3 >/dev/null || { echo "python3 required" >&2; exit 1; }
 
 if ss -ltn 2>/dev/null | grep -q ":$PORT "; then
