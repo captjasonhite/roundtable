@@ -538,6 +538,8 @@ def ranking_labels(text):
 
 want = {l.strip() for l in E.get("REQUIRE_LABELS", "").split(",") if l.strip()}
 retried = False
+retry_tokens = 0
+retry_elapsed = 0.0
 if want and not err and ranking_labels(content) != want:
     tags = " > ".join("{{%s}}" % l for l in sorted(want))
     follow = ("Reply with ONE line and nothing else — no preamble, no "
@@ -552,6 +554,7 @@ if want and not err and ranking_labels(content) != want:
     ]
     # Enough room for a thinking model to reason its way to one line.
     retry_body["max_tokens"] = 1024
+    t1 = time.time()
     try:
         rr = urllib.request.Request(
             "http://127.0.0.1:%s/v1/chat/completions" % E["PORT"],
@@ -567,7 +570,11 @@ if want and not err and ranking_labels(content) != want:
                 line = "RANKING: " + RANKING_RE.search(text).group(1).strip()
                 # Drop the malformed original, or the reader finds it first.
                 content = RANKING_RE.sub("", content).rstrip() + "\n\n" + line
-                ntok += (rdata.get("usage") or {}).get("completion_tokens", 0) or 0
+                # Counted apart from the judging run, never folded into it:
+                # tokens/tokens_per_sec describe the verdict's own generation,
+                # and the report compares models on those numbers.
+                retry_tokens = (rdata.get("usage") or {}).get("completion_tokens", 0) or 0
+                retry_elapsed = time.time() - t1
                 retried = True
                 break
     except Exception:
@@ -594,6 +601,8 @@ with open(E["OUT_FILE"], "w") as f:
     f.write("error: %s\n"        % (esc(err) if err else "null"))
     if retried:
         f.write("ranking_retry: true\n")
+        f.write("ranking_retry_tokens: %d\n" % retry_tokens)
+        f.write("ranking_retry_sec: %d\n" % round(retry_elapsed))
     f.write("---\n\n")
     if err:
         f.write("## Error\n\n```\n%s\n```\n" % err)
