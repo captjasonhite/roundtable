@@ -252,6 +252,112 @@ class LiveServerTests(unittest.TestCase):
         self.assertIn("20260101-000002", body)
         self.assertIn("running", body)                # the live pill
 
+    # --- rerun buttons ------------------------------------------------------
+
+    RUN = ('---\nmodel: "alpha-7B"\nthinking: true\ntemperature: 1.0\nseed: 42\n'
+           'tokens: 10\ntokens_per_sec: 5.0\nelapsed_sec: 2\nerror: null\n---\n\n'
+           "## Output\n\nhello\n")
+
+    def session(self, name="20260101-000001", record=None, prompts=True):
+        path = os.path.join(self.root, name)
+        os.makedirs(path, exist_ok=True)
+        with open(os.path.join(path, "01_x_alpha_thinking.md"), "w") as f:
+            f.write(self.RUN)
+        if prompts:
+            with open(os.path.join(path, "system-prompt.txt"), "w") as f:
+                f.write("be brief")
+            with open(os.path.join(path, "user-prompt.txt"), "w") as f:
+                f.write("write a haiku")
+        if record is not None:
+            record = dict(record, session_dir=path)
+            spool.write_atomic(os.path.join(self.spool, "done", "j1.json"),
+                               json.dumps(record))
+        return path
+
+    def test_index_offers_both_rerun_buttons(self):
+        self.session()
+        _, body, _ = self.get("/")
+        self.assertIn('action="/rerun"', body)
+        self.assertIn(">Rerun<", body)
+        self.assertIn("/new?from=20260101-000001", body)
+
+    def test_rerun_queues_the_recorded_job(self):
+        """The job record is the better source: it holds what was asked for,
+        including settings the session dir cannot show."""
+        self.session(record={"id": "j1", "state": "done", "user_prompt": "the ask",
+                             "system_prompt": "be brief", "models": ["alpha:thinking"],
+                             "mode": "thinking", "summarize": True, "blind": True,
+                             "meta_summary": False, "meta_summary_requested": True,
+                             "env": {"MAX_TOKENS": "4096"},
+                             "exit_code": 0, "elapsed_sec": 12.3})
+        status, _, headers = self.get("/rerun", "POST",
+                                      "session=20260101-000001")
+        self.assertEqual(status, 303)
+        self.assertTrue(headers["Location"].startswith("/job/"))
+        queued = spool.pending(self.spool)
+        self.assertEqual(len(queued), 1)
+        with open(os.path.join(self.spool, "queue", queued[0])) as f:
+            job = json.load(f)
+        self.assertEqual(job["user_prompt"], "the ask")
+        self.assertEqual(job["models"], ["alpha:thinking"])
+        self.assertEqual(job["env"], {"MAX_TOKENS": "4096"})
+        # A Round 3 that was wanted but skipped is still wanted on a rerun.
+        self.assertTrue(job["meta_summary"])
+        # None of the finished run's bookkeeping comes along.
+        for key in ("exit_code", "elapsed_sec", "state", "session_dir", "finished"):
+            self.assertNotIn(key, job)
+        self.assertNotEqual(job["id"], "j1")          # a new job, not the old one
+
+    def test_rerun_falls_back_to_reading_the_session(self):
+        """A session started from the command line has no job record anywhere."""
+        self.session()
+        status, _, _ = self.get("/rerun", "POST", "session=20260101-000001")
+        self.assertEqual(status, 303)
+        with open(os.path.join(self.spool, "queue",
+                               spool.pending(self.spool)[0])) as f:
+            job = json.load(f)
+        self.assertEqual(job["user_prompt"], "write a haiku")
+        self.assertEqual(job["system_prompt"], "be brief")
+        self.assertEqual(job["models"], ["alpha-7B:thinking"])
+        self.assertEqual(job["seed"], 42)
+        self.assertFalse(job["summarize"])            # this session had no judges
+
+    def test_rerun_of_an_unknown_session_404s(self):
+        status, _, _ = self.get("/rerun", "POST", "session=nope")
+        self.assertEqual(status, 404)
+        self.assertEqual(spool.counts(self.spool)["queue"], 0)
+
+    def test_rerun_cannot_escape_the_sessions_root(self):
+        status, _, _ = self.get("/rerun", "POST", "session=../../etc")
+        self.assertEqual(status, 404)
+        self.assertEqual(spool.counts(self.spool)["queue"], 0)
+
+    def test_rerun_without_a_prompt_is_refused(self):
+        self.session(prompts=False)
+        status, page, _ = self.get("/rerun", "POST", "session=20260101-000001")
+        self.assertEqual(status, 409)
+        self.assertIn("no prompt", page)
+        self.assertEqual(spool.counts(self.spool)["queue"], 0)
+
+    def test_prompts_only_prefills_the_form_and_queues_nothing(self):
+        self.session(record={"id": "j1", "state": "done",
+                             "user_prompt": "write a haiku",
+                             "system_prompt": "be brief",
+                             "models": ["alpha:thinking"], "summarize": True})
+        status, page, _ = self.get("/new?from=20260101-000001")
+        self.assertEqual(status, 200)
+        self.assertIn("write a haiku", page)
+        self.assertIn("be brief", page)
+        # The models it ran with must NOT be preselected -- picking them again
+        # is the whole reason for this button.
+        self.assertNotIn('value="alpha" checked', page)
+        self.assertIn("Models and settings are back at their defaults", page)
+        self.assertEqual(spool.counts(self.spool)["queue"], 0)
+
+    def test_prompts_only_from_an_unknown_session_404s(self):
+        status, _, _ = self.get("/new?from=nope")
+        self.assertEqual(status, 404)
+
 
 class PresetRouteTests(unittest.TestCase):
     """The preset save/delete/reset routes, over real HTTP.

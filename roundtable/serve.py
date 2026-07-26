@@ -44,6 +44,23 @@ INDEX_CSS = report.CSS + """
 .row a:hover{text-decoration:underline}
 .row .meta{color:var(--muted);font-size:13px;margin-left:auto;
   font-variant-numeric:tabular-nums}
+.row .acts{display:flex;align-items:center;gap:10px;flex:none}
+.row .acts form{margin:0}
+.row .acts button{font-size:12.5px;font-weight:500;padding:5px 11px;
+  border-radius:7px;border:1px solid var(--border);background:none;
+  color:var(--ink2)}
+.row .acts button:hover{border-color:var(--series);color:var(--series);
+  filter:none}
+.row .acts a{font-size:12.5px;font-weight:500;color:var(--ink2);
+  text-decoration:none;border:1px solid var(--border);border-radius:7px;
+  padding:5px 11px}
+.row .acts a:hover{border-color:var(--series);color:var(--series);
+  text-decoration:none}
+@media (max-width:640px){
+  .row{flex-wrap:wrap}
+  .row .meta{margin-left:auto}
+  .row .acts{width:100%;justify-content:flex-end}
+}
 .pill{font-size:11.5px;text-transform:uppercase;letter-spacing:.05em;
   border:1px solid var(--border);border-radius:999px;padding:1px 8px;
   color:var(--ink2)}
@@ -148,8 +165,10 @@ def list_sessions(root):
             files = os.listdir(path)
         except OSError:
             continue
-        results = [f for f in files
-                   if f.endswith(".md") and not f.startswith(("SUMMARIZE", "summary_"))]
+        # session._is_result, not a looser filter of its own: it also excludes
+        # round3_*.md, which is the synthesis, not a seventh output run. The row
+        # said "7 runs" next to a report saying "6/6" until this was shared.
+        results = [f for f in files if session_mod._is_result(f)]
         if not results:
             continue
         has_report = "report.html" in files
@@ -208,11 +227,25 @@ def render_index(root, sp=None):
                     if r["report"] else "/s/%s/" % urllib.parse.quote(r["name"]))
             pill = ('<span class="pill live">running</span>' if r["live"]
                     else '<span class="pill">%d judges</span>' % r["judges"])
+            name = urllib.parse.quote(r["name"])
+            # Same settings is a POST: it queues a run. Prompts only is a plain
+            # link -- it just opens the form, nothing happens until you submit.
+            acts = ('<span class="acts">'
+                    '<form method="post" action="/rerun">'
+                    '<input type="hidden" name="session" value="%s">'
+                    '<button type="submit" title="Queue this exact run again — '
+                    'same prompts, same models, same settings">Rerun</button>'
+                    '</form>'
+                    '<a href="/new?from=%s" title="Open the form with these '
+                    'prompts filled in, so you can change the models and '
+                    'settings before running">Rerun prompts only</a></span>'
+                    % (html.escape(r["name"]), name))
             parts.append('<div class="row"><a href="%s">%s</a>%s'
-                         '<span class="meta">%d runs · %s</span></div>'
+                         '<span class="meta">%d runs · %s</span>%s</div>'
                          % (link, html.escape(r["name"]), pill, r["runs"],
                             time.strftime("%Y-%m-%d %H:%M",
-                                          time.localtime(r["mtime"]))))
+                                          time.localtime(r["mtime"])),
+                            acts))
         parts.append("</div>")
 
     parts.append("<footer>Reports are static files. A running session&rsquo;s report "
@@ -679,6 +712,128 @@ def job_from_form(fields, models_root=None):
     return job, None
 
 
+# Bookkeeping the worker adds to a finished job record. A rerun must not carry
+# any of it: "id" and "created" would collide with the original in the spool,
+# and the rest describes a run that has already happened.
+_RECORD_ONLY = ("id", "created", "finished", "state", "session_dir", "exit_code",
+                "log", "elapsed_sec", "meta_summary_requested")
+
+
+def job_for_session(name, root, sp=None):
+    """The job that would run this session again. -> (job, source) or (None, None).
+
+    Prefers the exact job record the session came from: it holds what was asked
+    for, including the parts the session dir cannot show (max tokens, the preset
+    the system prompt came from, whether Round 3 was wanted at all). Falls back
+    to reading the settings back off the session itself, so a session started
+    from the command line -- with no job record anywhere -- reruns too.
+    """
+    job = _job_from_record(name, sp)
+    if job:
+        return job, "record"
+    job = _job_from_session(os.path.join(root, name))
+    return (job, "session") if job else (None, None)
+
+
+def _job_from_record(name, sp=None):
+    p = spool.paths(sp)
+    newest = None
+    for state in ("done", "failed"):
+        directory = p[state]
+        try:
+            entries = os.listdir(directory)
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.endswith(".json"):
+                continue
+            path = os.path.join(directory, entry)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    record = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(record, dict):
+                continue
+            sdir = record.get("session_dir") or ""
+            if os.path.basename(sdir.rstrip("/")) != name:
+                continue
+            if newest is None or record.get("finished", "") > newest[0]:
+                newest = (record.get("finished", ""), record)
+    if newest is None:
+        return None
+    record = newest[1]
+    job = {k: v for k, v in record.items() if k not in _RECORD_ONLY}
+    # "meta_summary" in a finished record is the *result* -- whether Round 3
+    # actually ran -- which is False for a job that asked for it and had it
+    # skipped. The request itself is what a rerun should repeat.
+    if "meta_summary_requested" in record:
+        job["meta_summary"] = bool(record["meta_summary_requested"])
+    return job
+
+
+def _job_from_session(sdir):
+    """Read a job back off a session directory. -> job dict, or None.
+
+    Everything here is recoverable from what the run left behind: the prompts
+    from their own files, the queue from each result's frontmatter. Max tokens
+    is not -- no file records it -- so a rerun built this way takes the default.
+    """
+    data = session_mod.load(sdir)
+    if not data:
+        return None
+    modes = {}
+    for run in data["runs"]:
+        mode = "nothinking" if run["mode"] == "no thinking" else "thinking"
+        modes.setdefault(run["model"], set()).add(mode)
+    patterns = []
+    for model in sorted(modes):
+        found = modes[model]
+        patterns.append("%s:%s" % (model, "both" if len(found) > 1
+                                   else next(iter(found))))
+    if not patterns:
+        return None
+    job = {
+        "system_prompt": data["system_prompt"].strip(),
+        "user_prompt": data["user_prompt"].strip(),
+        "mode": "thinking",
+        "models": patterns,
+        "summarize": bool(data["judges"]),
+        "meta_summary": bool(data["meta_summary"]),
+        "blind": data["blind"],
+    }
+    if str(data["seed"]).strip().isdigit():
+        job["seed"] = int(data["seed"])
+    return job
+
+
+def _safe_name(name):
+    """Session names come from the URL: keep them to a single directory entry."""
+    name = (name or "").strip().strip("/")
+    return name if name and "/" not in name and not name.startswith(".") else ""
+
+
+def _prompts_only(name, root, sp=None):
+    """Form values for "rerun prompts only". -> (values, notice) or (None, _).
+
+    Deliberately carries the prompts and nothing else: models, thinking modes
+    and rounds stay at the page's own defaults, which is the point of the button
+    -- you came here to change them.
+    """
+    name = _safe_name(name)
+    if not name or not os.path.isdir(os.path.join(root, name)):
+        return None, None
+    job, _source = job_for_session(name, root, sp)
+    if job is None:
+        return None, None
+    values = {"system_prompt": job.get("system_prompt", ""),
+              "user_prompt": job.get("user_prompt", "")}
+    if job.get("preset"):
+        values["preset"] = job["preset"]
+    return values, ("Prompts from %s. Models and settings are back at their "
+                    "defaults — set them below." % name)
+
+
 def find_job_session(job_id, sp=None):
     """Where has this job got to? -> (state, session_dir or None)."""
     p = spool.paths(sp)
@@ -810,6 +965,12 @@ def make_handler(root, sp=None):
                 notice = query.get("notice", [None])[0]
                 selected = query.get("preset", [None])[0]
                 values = {"preset": selected} if selected else None
+                source = query.get("from", [None])[0]
+                if source:
+                    values, from_notice = _prompts_only(source, root, sp)
+                    if values is None:
+                        return self._error(404, "No such session.")
+                    notice = notice or from_notice
                 return self._send(200, render_form(values=values, notice=notice))
             if path == "/health":
                 return self._send(200, json.dumps({"ok": True}),
@@ -852,6 +1013,8 @@ def make_handler(root, sp=None):
             path = posixpath.normpath(urllib.parse.urlparse(self.path).path)
             if path == "/submit":
                 return self._do_submit()
+            if path == "/rerun":
+                return self._do_rerun()
             if path == "/presets/save":
                 return self._do_preset_save()
             if path == "/presets/delete":
@@ -878,6 +1041,29 @@ def make_handler(root, sp=None):
                 return self._send(400, render_form(error=error, values=fields))
             job_id = spool.submit(job, sp)
             # 303: the browser must follow with GET, not repeat the POST.
+            return self._send(303, b"", extra={"Location": "/job/%s"
+                                               % urllib.parse.quote(job_id)})
+
+        def _do_rerun(self):
+            """Queue the same run again: same prompts, models and settings."""
+            parsed = self._read_form()
+            if parsed is None:
+                return
+            name = _safe_name((parsed.get("session") or [""])[-1])
+            if not name or not os.path.isdir(os.path.join(root, name)):
+                return self._error(404, "No such session.")
+            job, source = job_for_session(name, root, sp)
+            if job is None:
+                return self._error(
+                    409, "Nothing to rerun: this session has no job record and "
+                         "no result files to read its settings back from.")
+            if not (job.get("user_prompt") or "").strip():
+                # A session whose prompt file was emptied would otherwise queue
+                # a job the runner immediately rejects.
+                return self._error(409, "That session has no prompt to rerun.")
+            job["rerun_of"] = name
+            job["rerun_from"] = source
+            job_id = spool.submit(job, sp)
             return self._send(303, b"", extra={"Location": "/job/%s"
                                                % urllib.parse.quote(job_id)})
 
