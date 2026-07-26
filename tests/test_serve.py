@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.parse
 from http.server import ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -239,18 +240,105 @@ class LiveServerTests(unittest.TestCase):
         self.assertIn("the report", body)
         self.assertEqual(headers["Cache-Control"], "no-store")
 
+    def _session_dir(self, name, self_refreshing):
+        path = os.path.join(self.root, name)
+        os.makedirs(path, exist_ok=True)
+        with open(os.path.join(path, "01_x_model_thinking.md"), "w") as f:
+            f.write(self.RUN)          # a readable run, so the report can be rebuilt
+        with open(os.path.join(path, "report.html"), "w") as f:
+            f.write('<meta http-equiv="refresh" content="10">'
+                    if self_refreshing else "x")
+        return path
+
     def test_index_lists_sessions_and_flags_live_ones(self):
-        for name, running in (("20260101-000001", False), ("20260101-000002", True)):
-            path = os.path.join(self.root, name)
-            os.makedirs(path)
-            open(os.path.join(path, "01_x_model_thinking.md"), "w").close()
-            with open(os.path.join(path, "report.html"), "w") as f:
-                f.write('<meta http-equiv="refresh" content="10">' if running else "x")
+        self._session_dir("20260101-000001", False)
+        live = self._session_dir("20260101-000002", True)
+        spool.heartbeat(self.spool, state="running", job="j", session=live)
         status, body, _ = self.get("/")
         self.assertEqual(status, 200)
         self.assertIn("20260101-000001", body)
         self.assertIn("20260101-000002", body)
-        self.assertIn("running", body)                # the live pill
+        self.assertIn('<span class="pill live">running</span>', body)
+
+    def test_a_session_whose_run_died_is_not_called_live(self):
+        """The refresh tag outlives the run that wrote it; the worker decides."""
+        self._session_dir("20260101-000003", True)
+        spool.heartbeat(self.spool, state="idle")
+        status, body, _ = self.get("/")
+        self.assertEqual(status, 200)
+        self.assertNotIn('<span class="pill live">running</span>', body)
+        self.assertIn(">stopped</span>", body)
+        # ...and the index itself must stop reloading every 15 seconds.
+        self.assertNotIn('http-equiv="refresh"', body)
+
+    # --- cancelling and cleaning up -----------------------------------------
+
+    def _orphaned_claim(self, job_id="stuck", session_dir=None):
+        """A claim with no live worker behind it: what a reboot leaves."""
+        job = {"id": job_id, "user_prompt": "hi"}
+        if session_dir:
+            job["session_dir"] = session_dir
+        spool.write_atomic(os.path.join(self.spool, "running", job_id + ".json"),
+                           json.dumps(job))
+        spool.heartbeat(self.spool, state="running", job=job_id, pid=999999)
+
+    def test_a_stuck_job_shows_as_stopped_not_running(self):
+        self._orphaned_claim()
+        status, body, _ = self.get("/")
+        self.assertEqual(status, 200)
+        self.assertIn("stuck", body)
+        self.assertIn(">stopped</span>", body)
+        self.assertIn('action="/cancel"', body)
+
+        status, page, _ = self.get("/job/stuck")
+        self.assertEqual(status, 200)
+        self.assertIn("Stopped", page)
+        self.assertIn("Clear this job", page)
+        self.assertNotIn('http-equiv="refresh"', page)
+
+    def test_clearing_a_stuck_job_files_it_as_failed(self):
+        session = self._session_dir("20260101-000004", True)
+        self._orphaned_claim(session_dir=session)
+        status, _, headers = self.get("/cancel", "POST", "job=stuck")
+        self.assertEqual(status, 303)
+        self.assertTrue(headers["Location"].startswith("/?notice="))
+        self.assertEqual(spool.counts(self.spool)["running"], 0)
+        self.assertEqual(spool.counts(self.spool)["failed"], 1)
+        # Its report was rewritten, so it no longer reloads itself.
+        with open(os.path.join(session, "report.html")) as f:
+            self.assertNotIn('http-equiv="refresh"', f.read())
+
+    def test_cancelling_a_queued_job_dequeues_it(self):
+        spool.submit({"id": "waiting", "user_prompt": "hi"}, self.spool)
+        status, _, _ = self.get("/cancel", "POST", "job=waiting")
+        self.assertEqual(status, 303)
+        self.assertEqual(spool.counts(self.spool)["queue"], 0)
+        with open(os.path.join(self.spool, "failed", "waiting.json")) as f:
+            self.assertTrue(json.load(f)["cancelled"])
+
+    def test_cancelling_a_live_run_asks_the_worker(self):
+        """Only the worker can kill the runner, so this records a request."""
+        spool.write_atomic(os.path.join(self.spool, "running", "live.json"),
+                           json.dumps({"id": "live"}))
+        spool.heartbeat(self.spool, state="running", job="live")  # our own pid
+        status, _, _ = self.get("/cancel", "POST", "job=live")
+        self.assertEqual(status, 303)
+        self.assertTrue(spool.cancel_requested("live", self.spool))
+        self.assertEqual(spool.counts(self.spool)["running"], 1)
+
+    def test_cancelling_a_finished_job_is_refused(self):
+        spool.write_atomic(os.path.join(self.spool, "done", "old.json"),
+                           json.dumps({"id": "old"}))
+        self.assertEqual(self.get("/cancel", "POST", "job=old")[0], 409)
+        self.assertEqual(self.get("/cancel", "POST", "job=ghost")[0], 409)
+
+    def test_cleanup_clears_every_stuck_job(self):
+        self._orphaned_claim("stuck-a")
+        self._orphaned_claim("stuck-b")
+        status, _, headers = self.get("/cleanup", "POST", "")
+        self.assertEqual(status, 303)
+        self.assertIn("2", urllib.parse.unquote(headers["Location"]))
+        self.assertEqual(spool.counts(self.spool)["running"], 0)
 
     # --- rerun buttons ------------------------------------------------------
 

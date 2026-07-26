@@ -75,6 +75,8 @@ roundtable submit job.json               # queue a bench run
 roundtable work                          # run queued jobs, one at a time
 roundtable work --drain                  # ...then stop when the queue empties
 roundtable status                        # queue depth + what the worker is doing
+roundtable cancel JOB                    # stop a queued or running job
+roundtable clean                         # clear jobs a dead worker left claimed
 ```
 
 `--running` is how live progress works without a server: the report is rewritten
@@ -99,6 +101,7 @@ $ROUNDTABLE_SPOOL/          (default ~/.local/state/roundtable)
     failed/    what went wrong, kept for reading
     logs/      runner output, one file per job
     worker.json  heartbeat: which worker, doing what, since when
+    cancel.json  a standing request to stop one job, if any
 ```
 
 No lock, no database, no daemon protocol. A worker claims a job by **renaming**
@@ -110,6 +113,21 @@ mid-run: the job file is still sitting in `running/`.
 A single worker consuming the queue serially *is* the "one model in VRAM at a
 time" constraint — expressed as architecture rather than as a mutex someone has
 to remember to take.
+
+### Stopping a run, and runs that stopped themselves
+
+Cancel is a file too: the UI (and `roundtable cancel`) writes `cancel.json`, the
+worker notices within a second, kills the runner's whole process group — model
+included — and files the job as failed. Whatever finished is kept, and the
+session's report is rewritten as a finished one.
+
+Nothing is lost when the machine dies mid-run, but nothing *notices* either: the
+claim sits in `running/` and reads as in flight forever. So a worker reaps on
+startup and whenever it goes idle — any claim no live worker owns is failed, and
+its half-written report settled. The index shows those as **stopped** with a
+button to clear them, and `roundtable clean` does the same from a shell. Reaped
+jobs are failed rather than requeued: a rerun would start a second session from
+scratch while the first is still on disk, so that call belongs to you.
 
 A job is plain JSON:
 

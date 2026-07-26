@@ -7,12 +7,15 @@
         failed/    what went wrong, kept for reading
         logs/      runner output, one file per job
         worker.json  heartbeat: which worker, doing what, since when
+        cancel.json  a standing request to stop one job, if any
 
 There is no lock, no database and no daemon protocol. A worker claims a job by
 *renaming* it out of ``queue/`` -- rename is atomic within a filesystem, so if
 two workers ever race, exactly one wins and the loser sees FileNotFoundError.
 Everything is inspectable with ``ls``, and nothing is lost if the machine dies
-mid-run: the job file is still sitting in ``running/``.
+mid-run: the job file is still sitting in ``running/``. Nothing *else* notices
+that, though, which is what ``orphans``/``reap`` are for -- a claim whose worker
+is gone has to be failed by whoever comes next, or it reads as running forever.
 """
 import json
 import os
@@ -125,6 +128,143 @@ def finish(running_path, state, extra=None, spool=None):
     except OSError:
         pass
     return dst
+
+
+def read_job(path):
+    """One job file -> dict. Unreadable files still get an id, from the name."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {"id": os.path.basename(path)[:-5]}
+
+
+def jobs(state, spool=None):
+    """Job files in one state, oldest first. -> [(path, job dict)]."""
+    p = paths(spool)
+    try:
+        names = [n for n in os.listdir(p[state])
+                 if n.endswith(".json") and not n.startswith(".")]
+    except OSError:
+        return []
+    names.sort(key=lambda n: os.path.getmtime(os.path.join(p[state], n)))
+    out = []
+    for name in names:
+        path = os.path.join(p[state], name)
+        job = read_job(path)
+        job.setdefault("id", name[:-5])
+        out.append((path, job))
+    return out
+
+
+def _alive(pid):
+    """Is that pid a running process? Anything unknown counts as dead.
+
+    Signal 0 checks existence without delivering anything. EPERM means the pid
+    exists but belongs to someone else, which still counts as alive.
+    """
+    try:
+        os.kill(int(pid), 0)
+    except PermissionError:
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
+
+
+def orphans(spool=None):
+    """Claims in running/ with no worker behind them. -> [path], oldest first.
+
+    A machine that reboots mid-run leaves its claim in running/ forever: the
+    rename that claimed it survived, the process that was going to finish it did
+    not. Nothing else notices, so the job shows as "running" until someone reads
+    the directory by hand.
+
+    The one claim that is not an orphan is the one a *live* worker says it is
+    working on right now, so a second worker starting up can never fail a run
+    that is genuinely in flight.
+    """
+    p = paths(spool)
+    beat = read_heartbeat(spool) or {}
+    mine = None
+    if beat.get("state") == "running" and _alive(beat.get("pid")):
+        mine = str(beat.get("job") or "") + ".json"
+    try:
+        names = sorted(n for n in os.listdir(p["running"])
+                       if n.endswith(".json") and not n.startswith("."))
+    except OSError:
+        return []
+    return [os.path.join(p["running"], n) for n in names if n != mine]
+
+
+def reap(spool=None, reason=None):
+    """Fail every orphaned claim. -> [(job id, session_dir or None)].
+
+    Failed rather than requeued: the runner writes into a session directory as
+    it goes, so re-running would start a second one from scratch while the half
+    finished first is still on disk. What did complete is kept and readable;
+    rerunning is the reader's call, not ours.
+    """
+    reason = reason or ("worker stopped without finishing this job "
+                        "(machine rebooted, or the process was killed)")
+    reaped = []
+    for path in orphans(spool):
+        job = read_job(path)
+        finish(path, "failed", {"error": reason, "reaped": True}, spool=spool)
+        reaped.append((job.get("id", os.path.basename(path)[:-5]),
+                       job.get("session_dir")))
+    return reaped
+
+
+def note(running_path, spool=None, **fields):
+    """Record something about a claim in the claim file itself.
+
+    Used for the session directory, so a claim that is later found orphaned says
+    where its half-finished session is rather than needing a heartbeat that a
+    reboot has already overwritten.
+    """
+    job = read_job(running_path)
+    job.update(fields)
+    try:
+        write_atomic(running_path, json.dumps(job, indent=2))
+    except OSError:
+        pass
+    return job
+
+
+CANCEL_FILE = "cancel.json"
+
+
+def request_cancel(job_id, spool=None):
+    """Ask the worker to abandon the job it is running. -> the request dict.
+
+    A file, like everything else here: the worker polls it once a second while a
+    run is in flight, so cancelling needs no signal, no pid and no socket -- and
+    works just as well when the thing asking is an HTTP handler in another
+    process.
+    """
+    spool = ensure(spool)
+    req = {"job": job_id, "asked": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    write_atomic(os.path.join(spool, CANCEL_FILE), json.dumps(req, indent=2))
+    return req
+
+
+def cancel_requested(job_id, spool=None):
+    """Has anyone asked for this job to stop?"""
+    path = os.path.join(spool or DEFAULT_SPOOL, CANCEL_FILE)
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f).get("job") == job_id
+    except (OSError, ValueError):
+        return False
+
+
+def clear_cancel(spool=None):
+    """Drop a cancel request once it has been acted on."""
+    try:
+        os.remove(os.path.join(spool or DEFAULT_SPOOL, CANCEL_FILE))
+    except OSError:
+        pass
 
 
 def requeue(running_path, spool=None):

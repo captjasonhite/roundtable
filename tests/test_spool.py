@@ -87,6 +87,42 @@ class SpoolTests(unittest.TestCase):
         self.assertEqual(spool.counts(self.spool)["queue"], 1)
         self.assertEqual(spool.counts(self.spool)["running"], 0)
 
+    def test_claim_with_no_live_worker_is_an_orphan(self):
+        """The reboot case: the claim survived, the process that made it didn't."""
+        spool.submit({"id": "job-orphan"}, self.spool)
+        _, path = spool.claim(self.spool)
+        spool.heartbeat(self.spool, state="running", job="job-orphan", pid=999999)
+        self.assertEqual(spool.orphans(self.spool), [path])
+
+        reaped = spool.reap(self.spool)
+        self.assertEqual([job_id for job_id, _ in reaped], ["job-orphan"])
+        self.assertEqual(spool.counts(self.spool)["running"], 0)
+        self.assertEqual(spool.counts(self.spool)["failed"], 1)
+        with open(os.path.join(self.spool, "failed", "job-orphan.json")) as f:
+            self.assertTrue(json.load(f)["reaped"])
+
+    def test_a_live_workers_job_is_never_reaped(self):
+        spool.submit({"id": "job-live"}, self.spool)
+        spool.claim(self.spool)
+        spool.heartbeat(self.spool, state="running", job="job-live")  # our own pid
+        self.assertEqual(spool.orphans(self.spool), [])
+        self.assertEqual(spool.reap(self.spool), [])
+        self.assertEqual(spool.counts(self.spool)["running"], 1)
+
+    def test_reap_reports_the_half_written_session(self):
+        spool.submit({"id": "job-half"}, self.spool)
+        _, path = spool.claim(self.spool)
+        spool.note(path, session_dir="/tmp/half")
+        spool.heartbeat(self.spool, state="running", job="job-half", pid=999999)
+        self.assertEqual(spool.reap(self.spool), [("job-half", "/tmp/half")])
+
+    def test_cancel_request_names_one_job(self):
+        spool.request_cancel("job-x", self.spool)
+        self.assertTrue(spool.cancel_requested("job-x", self.spool))
+        self.assertFalse(spool.cancel_requested("job-y", self.spool))
+        spool.clear_cancel(self.spool)
+        self.assertFalse(spool.cancel_requested("job-x", self.spool))
+
     def test_heartbeat_roundtrip(self):
         spool.heartbeat(self.spool, state="running", job="job-9")
         beat = spool.read_heartbeat(self.spool)

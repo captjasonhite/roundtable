@@ -65,6 +65,10 @@ INDEX_CSS = report.CSS + """
   border:1px solid var(--border);border-radius:999px;padding:1px 8px;
   color:var(--ink2)}
 .live{border-color:var(--pos);color:var(--pos)}
+.stale{border-color:var(--neg);color:var(--neg)}
+button.danger{font:inherit;font-size:14px;font-weight:600;padding:9px 18px;
+  border-radius:8px;border:1px solid var(--neg);background:none;color:var(--neg)}
+button.danger:hover{background:var(--neg);color:#fff;filter:none}
 label{display:block;font-weight:600;font-size:13.5px;margin:0 0 5px}
 .field{margin:0 0 20px}
 .hint{color:var(--muted);font-size:12.5px;margin:5px 0 0;font-weight:400}
@@ -189,14 +193,67 @@ def list_sessions(root):
     return out
 
 
-def render_index(root, sp=None):
+def _job_card(jobs, notice=None):
+    """The "in flight" card: what is queued or running, and how to stop it."""
+    parts = []
+    if notice:
+        parts.append('<div class="card"><p class="note">%s</p></div>'
+                     % html.escape(notice))
+    if not jobs:
+        return "\n".join(parts)
+    parts.append('<div class="card">')
+    for job in jobs:
+        if job["stale"]:
+            pill = '<span class="pill stale">stopped</span>'
+            what = ("claimed but no worker is running it — the machine or the "
+                    "worker went down mid-run")
+            button = "Clear"
+        elif job["state"] == "running":
+            pill = '<span class="pill live">running</span>'
+            what = "in flight now"
+            button = "Cancel"
+        else:
+            pill = '<span class="pill">queued</span>'
+            what = "waiting for the worker"
+            button = "Cancel"
+        link = ""
+        if job["session"]:
+            name = os.path.basename(str(job["session"]).rstrip("/"))
+            link = (' · <a href="/s/%s/report.html">%s</a>'
+                    % (urllib.parse.quote(name), html.escape(name)))
+        parts.append(
+            '<div class="row"><a href="/job/%s">%s</a>%s'
+            '<span class="meta">%s%s</span>'
+            '<span class="acts"><form method="post" action="/cancel">'
+            '<input type="hidden" name="job" value="%s">'
+            '<button type="submit">%s</button></form></span></div>'
+            % (urllib.parse.quote(job["id"]), html.escape(job["id"]), pill,
+               html.escape(what), link, html.escape(job["id"]), button))
+    parts.append("</div>")
+    return "\n".join(parts)
+
+
+def render_index(root, sp=None, notice=None):
     counts = spool.counts(sp)
     beat = spool.read_heartbeat(sp) or {}
     rows = list_sessions(root)
+    jobs = active_jobs(sp)
+    # A session is live because a worker says so, never because the last report
+    # written into it happens to carry a refresh tag -- that tag outlives the
+    # run that wrote it, and a session killed mid-run keeps it forever.
+    live_dirs = {os.path.basename(str(j["session"]).rstrip("/"))
+                 for j in jobs if j["session"] and not j["stale"]}
+    if beat.get("state") == "running" and beat.get("session"):
+        live_dirs.add(os.path.basename(str(beat["session"]).rstrip("/")))
+    for r in rows:
+        r["stalled"] = r["live"] and r["name"] not in live_dirs
+        r["live"] = r["live"] and r["name"] in live_dirs
 
     parts = ['<!doctype html><html lang="en"><head><meta charset="utf-8">',
              '<meta name="viewport" content="width=device-width,initial-scale=1">']
-    if any(r["live"] for r in rows) or counts["running"] or counts["queue"]:
+    # Stale claims are excluded deliberately: a page that reloads every 15
+    # seconds forever is exactly the symptom of the bug this repairs.
+    if any(r["live"] for r in rows) or any(not j["stale"] for j in jobs):
         parts.append('<meta http-equiv="refresh" content="15">')
     parts.append("<title>Roundtable</title>%s<style>%s</style></head><body>"
                  "<div class=\"wrap\">" % (FAVICON_HEAD, INDEX_CSS))
@@ -217,6 +274,10 @@ def render_index(root, sp=None):
                  'font-size:14.5px;text-decoration:none;padding:11px 22px;'
                  'border-radius:8px">New run</a></p>')
 
+    card = _job_card(jobs, notice)
+    if card:
+        parts.append(card)
+
     if not rows:
         parts.append('<div class="card"><p class="note">No sessions yet. '
                      'Start one with <b>New run</b> above.</p></div>')
@@ -225,8 +286,15 @@ def render_index(root, sp=None):
         for r in rows:
             link = ("/s/%s/report.html" % urllib.parse.quote(r["name"])
                     if r["report"] else "/s/%s/" % urllib.parse.quote(r["name"]))
-            pill = ('<span class="pill live">running</span>' if r["live"]
-                    else '<span class="pill">%d judges</span>' % r["judges"])
+            if r["live"]:
+                pill = '<span class="pill live">running</span>'
+            elif r["stalled"]:
+                # Its report still reloads itself, but nothing is feeding it.
+                pill = ('<span class="pill stale" title="This run stopped part '
+                        'way through — its report was last written mid-run">'
+                        'stopped</span>')
+            else:
+                pill = '<span class="pill">%d judges</span>' % r["judges"]
             name = urllib.parse.quote(r["name"])
             # Same settings is a POST: it queues a run. Prompts only is a plain
             # link -- it just opens the form, nothing happens until you submit.
@@ -238,8 +306,13 @@ def render_index(root, sp=None):
                     '</form>'
                     '<a href="/new?from=%s" title="Open the form with these '
                     'prompts filled in, so you can change the models and '
-                    'settings before running">Rerun prompts only</a></span>'
-                    % (html.escape(r["name"]), name))
+                    'settings before running">Rerun prompts only</a>%s</span>'
+                    % (html.escape(r["name"]), name,
+                       # Rewrites the report without the reload tag, so a run
+                       # that died stops pretending it is still going.
+                       ('<a href="/rebuild/%s" title="Rewrite this report as a '
+                        'finished one, so it stops reloading itself">Settle'
+                        '</a>' % name) if r["stalled"] else ""))
             parts.append('<div class="row"><a href="%s">%s</a>%s'
                          '<span class="meta">%d runs · %s</span>%s</div>'
                          % (link, html.escape(r["name"]), pill, r["runs"],
@@ -845,20 +918,102 @@ def find_job_session(job_id, sp=None):
                     return state, json.load(f).get("session_dir")
             except (OSError, ValueError):
                 return state, None
-    if os.path.exists(os.path.join(p["running"], job_id + ".json")):
+    claim = os.path.join(p["running"], job_id + ".json")
+    if os.path.exists(claim):
+        # Claimed, but by whom? A claim no live worker owns is not running --
+        # calling it "running" is what made a rebooted run look alive for good.
+        session_dir = spool.read_job(claim).get("session_dir")
+        if claim in spool.orphans(sp):
+            return "stopped", session_dir
         beat = spool.read_heartbeat(sp) or {}
         if beat.get("job") == job_id:
-            return "running", beat.get("session")
-        return "running", None
+            return "running", beat.get("session") or session_dir
+        return "running", session_dir
     if os.path.exists(os.path.join(p["queue"], job_id + ".json")):
         return "queued", None
     return "unknown", None
 
 
+def cancel_job(job_id, root, sp=None):
+    """Stop a queued or running job. -> (ok, message).
+
+    Queued is settled here and now: the claim never happened, so moving the file
+    to failed/ is the whole operation. Running is a request instead -- only the
+    worker can kill the runner it started -- unless nothing is behind the claim,
+    in which case this is really a reap and there is nobody to ask.
+    """
+    p = spool.paths(sp)
+    name = job_id + ".json"
+    queued = os.path.join(p["queue"], name)
+    if os.path.exists(queued):
+        spool.finish(queued, "failed",
+                     {"error": "cancelled", "cancelled": True}, spool=sp)
+        spool.clear_cancel(sp)
+        return True, "Cancelled before it started."
+
+    running = os.path.join(p["running"], name)
+    if os.path.exists(running):
+        if running in spool.orphans(sp):
+            clean_up(root, sp)
+            return True, "Cleared: no worker was running that job."
+        spool.request_cancel(job_id, sp)
+        return True, ("Asked the worker to stop. It kills the model within a "
+                      "few seconds; finished runs are kept.")
+
+    for state in ("done", "failed"):
+        if os.path.exists(os.path.join(p[state], name)):
+            return False, "That job already finished."
+    return False, "No such job."
+
+
+def clean_up(root, sp=None):
+    """Fail every claim with no worker behind it. -> [job id].
+
+    The button behind this exists because the failure it repairs is invisible:
+    a reboot mid-run leaves a claim that nothing else will ever touch, and the
+    session it belongs to keeps reloading itself as though it were still going.
+    """
+    reaped = spool.reap(sp)
+    for _, session_dir in reaped:
+        if session_dir:
+            rebuild_session(root, os.path.basename(str(session_dir).rstrip("/")), sp)
+    return [job_id for job_id, _ in reaped]
+
+
+def active_jobs(sp=None):
+    """Queued and unfinished jobs, for the index. -> [{id, state, stale, ...}].
+
+    ``stale`` is the whole point: a claim in running/ that no live worker owns
+    is not running, however much the directory layout says it is.
+    """
+    orphaned = set(spool.orphans(sp))
+    beat = spool.read_heartbeat(sp) or {}
+    out = []
+    for path, job in spool.jobs("running", sp):
+        stale = path in orphaned
+        out.append({
+            "id": job.get("id", ""),
+            "state": "stale" if stale else "running",
+            "stale": stale,
+            "created": job.get("created", ""),
+            "session": (job.get("session_dir")
+                        or (beat.get("session") if not stale else None)),
+            "models": len(job.get("models") or []),
+        })
+    for _, job in spool.jobs("queue", sp):
+        out.append({"id": job.get("id", ""), "state": "queued", "stale": False,
+                    "created": job.get("created", ""), "session": None,
+                    "models": len(job.get("models") or [])})
+    return out
+
+
 def render_job(job_id, root, sp=None):
     """The waiting page: redirects itself to the report once one exists."""
     state, session_dir = find_job_session(job_id, sp)
-    if session_dir:
+    # A stopped job is the exception: its report still has the reload tag from
+    # the last write before the worker died, so sending someone straight to it
+    # hides the very thing they came here to deal with.
+    if session_dir and state != "stopped":
         name = os.path.basename(session_dir.rstrip("/"))
         target = "/s/%s/report.html" % urllib.parse.quote(name)
         if os.path.exists(os.path.join(root, name, "report.html")):
@@ -877,6 +1032,11 @@ def render_job(job_id, root, sp=None):
         headline, detail = "Running", (
             "Loading the first model. This page will switch to the live report "
             "as soon as the first result lands.")
+    elif state == "stopped":
+        headline, detail = "Stopped", (
+            "This job is still claimed, but no worker is running it — the "
+            "machine or the worker went down mid-run. Clearing it files the job "
+            "as failed and settles its report; whatever finished is kept.")
     elif state == "failed":
         headline, detail = "Failed", (
             "The run did not finish. See the job log under the spool directory.")
@@ -888,9 +1048,22 @@ def render_job(job_id, root, sp=None):
     body = ["<h1>%s</h1>" % html.escape(headline),
             '<p class="sub">job %s · worker %s</p>'
             % (html.escape(job_id), html.escape(str(beat.get("state", "unknown")))),
-            '<div class="card"><p class="note">%s</p></div>' % html.escape(detail),
-            '<p class="note"><a href="/">All sessions</a> · '
-            '<a href="/new">Queue another</a></p>']
+            '<div class="card"><p class="note">%s</p></div>' % html.escape(detail)]
+    if state in ("queued", "running", "stopped"):
+        body.append(
+            '<p><form method="post" action="/cancel" style="margin:0 0 16px">'
+            '<input type="hidden" name="job" value="%s">'
+            '<input type="hidden" name="back" value="job">'
+            '<button type="submit" class="danger">%s</button></form></p>'
+            % (html.escape(job_id),
+               "Clear this job" if state == "stopped" else "Cancel this run"))
+    if session_dir:
+        name = os.path.basename(session_dir.rstrip("/"))
+        body.append('<p class="note">Results so far: '
+                    '<a href="/s/%s/report.html">%s</a></p>'
+                    % (urllib.parse.quote(name), html.escape(name)))
+    body.append('<p class="note"><a href="/">All sessions</a> · '
+                '<a href="/new">Queue another</a></p>')
     refresh = "3" if state in ("queued", "running") else None
     return _page("%s — Roundtable" % headline, "\n".join(body), refresh), None
 
@@ -959,7 +1132,9 @@ def make_handler(root, sp=None):
         def do_GET(self):
             path = posixpath.normpath(urllib.parse.urlparse(self.path).path)
             if path in ("/", "/index.html"):
-                return self._send(200, render_index(root, sp))
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                return self._send(200, render_index(
+                    root, sp, notice=query.get("notice", [None])[0]))
             if path == "/new":
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 notice = query.get("notice", [None])[0]
@@ -1015,6 +1190,10 @@ def make_handler(root, sp=None):
                 return self._do_submit()
             if path == "/rerun":
                 return self._do_rerun()
+            if path == "/cancel":
+                return self._do_cancel()
+            if path == "/cleanup":
+                return self._do_cleanup()
             if path == "/presets/save":
                 return self._do_preset_save()
             if path == "/presets/delete":
@@ -1066,6 +1245,33 @@ def make_handler(root, sp=None):
             job_id = spool.submit(job, sp)
             return self._send(303, b"", extra={"Location": "/job/%s"
                                                % urllib.parse.quote(job_id)})
+
+        def _do_cancel(self):
+            """Stop one job: queued, running, or left claimed by a dead worker."""
+            parsed = self._read_form()
+            if parsed is None:
+                return
+            job_id = _safe_name((parsed.get("job") or [""])[-1])
+            if not job_id:
+                return self._error(400, "No job given.")
+            ok, message = cancel_job(job_id, root, sp)
+            if not ok:
+                return self._error(409, message)
+            back = (parsed.get("back") or [""])[-1]
+            if back == "job":
+                return self._send(303, b"", extra={
+                    "Location": "/job/%s" % urllib.parse.quote(job_id)})
+            return self._send(303, b"", extra={
+                "Location": "/?notice=%s" % urllib.parse.quote(message)})
+
+        def _do_cleanup(self):
+            if self._read_form() is None:
+                return
+            reaped = clean_up(root, sp)
+            notice = ("Cleared %d stopped job(s)." % len(reaped) if reaped
+                      else "Nothing to clean up.")
+            return self._send(303, b"", extra={
+                "Location": "/?notice=%s" % urllib.parse.quote(notice)})
 
         def _do_preset_save(self):
             parsed = self._read_form()

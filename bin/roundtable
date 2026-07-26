@@ -9,6 +9,8 @@
     roundtable serve                           serve the form and reports only
     roundtable benchmarks                      roll up scores.json by sampler profile
     roundtable status                          queue depth and what the worker is doing
+    roundtable cancel JOB                      stop a queued or running job
+    roundtable clean                           clear jobs left claimed by a dead worker
 
 Reports are written to <session>/report.html, atomically, so a browser reloading
 the page can never catch a partial file. Requires nothing but Python 3.
@@ -177,6 +179,28 @@ def cmd_status(args):
     if beat.get("session"):
         bits.append(beat["session"])
     print(" · ".join(bits))
+    stale = spool.orphans(args.spool)
+    for path in stale:
+        print("stale: %s is claimed but no worker is running it — "
+              "'roundtable clean' clears it"
+              % os.path.basename(path)[:-5])
+    return 0
+
+
+def cmd_cancel(args):
+    """Stop one job, whatever state it is in."""
+    ok, message = serve.cancel_job(args.job, _sessions_root(args), args.spool)
+    print(message)
+    return 0 if ok else 1
+
+
+def cmd_clean(args):
+    """Clear claims left behind by a worker that is gone."""
+    reaped = serve.clean_up(_sessions_root(args), args.spool)
+    if not reaped:
+        print("nothing to clean up")
+    for job_id in reaped:
+        print("cleared %s" % job_id)
     return 0
 
 
@@ -250,6 +274,17 @@ def main(argv=None):
     st = subs.add_parser("status", help="queue depth and worker state")
     st.add_argument("--spool", help="spool directory (default %s)" % spool.DEFAULT_SPOOL)
     st.set_defaults(func=cmd_status)
+
+    cn = subs.add_parser("cancel", help="stop a queued or running job")
+    cn.add_argument("job", help="job id, as shown by 'roundtable status'")
+    cn.add_argument("--sessions", help="sessions root (default %s)" % DEFAULT_ROOT)
+    cn.add_argument("--spool", help="spool directory (default %s)" % spool.DEFAULT_SPOOL)
+    cn.set_defaults(func=cmd_cancel)
+
+    cl = subs.add_parser("clean", help="clear jobs left claimed by a dead worker")
+    cl.add_argument("--sessions", help="sessions root (default %s)" % DEFAULT_ROOT)
+    cl.add_argument("--spool", help="spool directory (default %s)" % spool.DEFAULT_SPOOL)
+    cl.set_defaults(func=cmd_clean)
 
     args = p.parse_args(argv)
     if not getattr(args, "func", None):

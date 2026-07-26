@@ -20,6 +20,11 @@ from roundtable import spool, worker
 STUB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stub_runner.sh")
 
 
+def _listing_len(root):
+    return len([n for n in os.listdir(root)
+                if os.path.isdir(os.path.join(root, n))])
+
+
 def render(session_dir, running):
     """The same wiring bin/roundtable uses for its live rebuilds."""
     data = session_mod.load(session_dir)
@@ -154,6 +159,75 @@ class WorkerLoopTests(unittest.TestCase):
                     report_every=0.1, log=lambda *a: None)
         self.assertIn(True, seen)          # at least one live rebuild happened
         self.assertFalse(seen[-1])         # the last one was the final write
+
+    def test_cancelling_a_running_job_stops_it_and_keeps_going(self):
+        """The reason cancel exists: a run that is wrong from the first output."""
+        spool.submit(self.job(id="cancel-me"), self.spool)
+        spool.submit(self.job(id="next-one"), self.spool)
+        os.environ["STUB_DELAY"] = "2"
+
+        def spy(session_dir, running):
+            # Once anything has been produced, ask for the run to stop.
+            spool.request_cancel("cancel-me", self.spool)
+            return render(session_dir, running)
+
+        ran = worker.loop(sp=self.spool, runner=STUB, on_report=spy, drain=True,
+                          report_every=0.1, log=lambda *a: None)
+        self.assertEqual(ran, 1, "the second job must still run")
+
+        with open(os.path.join(self.spool, "failed", "cancel-me.json")) as f:
+            record = json.load(f)
+        self.assertTrue(record["cancelled"])
+        self.assertEqual(record["error"], "cancelled")
+        self.assertTrue(os.path.exists(
+            os.path.join(self.spool, "done", "next-one.json")))
+        # The request must not survive to cancel the next job as well.
+        self.assertFalse(spool.cancel_requested("next-one", self.spool))
+
+    def test_cancelling_a_queued_job_stops_it_before_it_starts(self):
+        spool.submit(self.job(id="never-runs"), self.spool)
+        spool.request_cancel("never-runs", self.spool)
+        os.environ["STUB_DELAY"] = "0"
+        ran = worker.loop(sp=self.spool, runner=STUB, on_report=render,
+                          drain=True, log=lambda *a: None)
+        self.assertEqual(ran, 0)
+        with open(os.path.join(self.spool, "failed", "never-runs.json")) as f:
+            self.assertTrue(json.load(f)["cancelled"])
+        self.assertEqual(_listing_len(self.sessions), 0)
+
+    def test_a_cancelled_run_stops_advertising_itself_as_live(self):
+        spool.submit(self.job(id="settle-me"), self.spool)
+        os.environ["STUB_DELAY"] = "2"
+
+        def spy(session_dir, running):
+            written = render(session_dir, running)
+            if written:          # only once there is a report to leave behind
+                spool.request_cancel("settle-me", self.spool)
+            return written
+
+        worker.loop(sp=self.spool, runner=STUB, on_report=spy, drain=True,
+                    report_every=0.1, log=lambda *a: None)
+        with open(os.path.join(self.spool, "failed", "settle-me.json")) as f:
+            sdir = json.load(f)["session_dir"]
+        with open(os.path.join(sdir, "report.html")) as f:
+            self.assertNotIn('http-equiv="refresh"', f.read())
+
+    def test_a_worker_reaps_the_claim_a_reboot_left_behind(self):
+        """What a rebooted machine leaves: a claim nobody will ever finish."""
+        spool.submit(self.job(id="orphaned"), self.spool)
+        _, path = spool.claim(self.spool)
+        spool.note(path, session_dir=self.sessions)
+        spool.heartbeat(self.spool, state="running", job="orphaned", pid=999999)
+
+        settled = []
+        worker.loop(sp=self.spool, runner=STUB, drain=True,
+                    on_report=lambda sdir, running: settled.append(running),
+                    log=lambda *a: None)
+        self.assertEqual(spool.counts(self.spool)["running"], 0)
+        with open(os.path.join(self.spool, "failed", "orphaned.json")) as f:
+            record = json.load(f)
+        self.assertTrue(record["reaped"])
+        self.assertEqual(settled, [False])   # its report was rewritten as static
 
     def test_runner_failure_is_recorded_not_raised(self):
         spool.submit(self.job(id="boom"), self.spool)

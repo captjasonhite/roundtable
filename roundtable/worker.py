@@ -64,6 +64,13 @@ class Stopping(Exception):
     """Raised in the main loop when a shutdown signal arrives."""
 
 
+class Cancelled(Exception):
+    """Raised when someone asked for *this job* to stop.
+
+    Distinct from Stopping: the worker keeps going and takes the next job.
+    """
+
+
 def _listing(root):
     try:
         return {n for n in os.listdir(root) if os.path.isdir(os.path.join(root, n))}
@@ -197,11 +204,14 @@ def run_meta_summary(job, session_dir, sp=None, runner=None, log=None):
 
 
 def run_job(job, running_path, sp=None, runner=None, on_report=None,
-            report_every=REPORT_EVERY, should_stop=None, sessions_root=None):
+            report_every=REPORT_EVERY, should_stop=None, sessions_root=None,
+            is_cancelled=None):
     """Run one job to completion. -> dict of result fields for the job record.
 
     ``on_report(session_dir, running)`` is called to regenerate the report; it
     is injected so tests can run the whole loop without importing the renderer.
+    ``is_cancelled()`` is polled the same way as ``should_stop()``; both kill the
+    runner's whole process group, they differ only in what the caller does next.
     """
     if sessions_root and not job.get("sessions_root"):
         # A job submitted from the form names no sessions root of its own; the
@@ -237,6 +247,8 @@ def run_job(job, running_path, sp=None, runner=None, on_report=None,
             while proc.poll() is None:
                 if should_stop and should_stop():
                     raise Stopping()
+                if is_cancelled and is_cancelled():
+                    raise Cancelled()
                 time.sleep(1.0)
                 if session_dir is None:
                     new = _listing(sessions_root) - before
@@ -244,6 +256,10 @@ def run_job(job, running_path, sp=None, runner=None, on_report=None,
                         session_dir = os.path.join(sessions_root, sorted(new)[-1])
                         spool.heartbeat(sp, job=job_id, session=session_dir,
                                         state="running")
+                        # Into the claim file too: a heartbeat does not survive
+                        # a reboot, and whoever reaps this claim afterwards needs
+                        # to know which session was left half-written.
+                        spool.note(running_path, session_dir=session_dir)
                 if not (session_dir and on_report):
                     continue
 
@@ -273,7 +289,7 @@ def run_job(job, running_path, sp=None, runner=None, on_report=None,
                     except Exception as exc:                  # never kill the run
                         log.write("\n[roundtable] report failed: %s\n" % exc)
                         log.flush()
-        except Stopping:
+        except (Stopping, Cancelled):
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             proc.wait(timeout=30)
             raise
@@ -349,14 +365,42 @@ def loop(sp=None, runner=None, on_report=None, once=False, drain=False,
     def stopping():
         return stop["now"] or bool(external_stop and external_stop())
 
+    def _settle(session_dir):
+        """Stop a killed job's session from advertising itself as live.
+
+        The last report written during a run carries the refresh tag; without
+        rewriting it once, a cancelled or reaped session reloads itself forever
+        and reads as still running to anyone who opens it.
+        """
+        if not (session_dir and on_report):
+            return
+        try:
+            on_report(session_dir, False)
+        except Exception:                     # a dead job is not worth failing over
+            pass
+
+    def _reap():
+        # Anything still claimed with no worker behind it belongs to a worker
+        # that is gone -- most often this machine rebooted mid-run.
+        for job_id, session_dir in spool.reap(sp):
+            _settle(session_dir)
+            log("reaped  %s (claimed by a worker that is no longer running)"
+                % job_id)
+
     ran = 0
     spool.heartbeat(sp, state="idle")
+    _reap()
+
     while not stopping():
         claimed = spool.claim(sp)
         if not claimed:
             if once or drain:
                 break
             spool.heartbeat(sp, state="idle")
+            # An idle worker owns nothing, so a claim that appears while it is
+            # idle -- a run killed by the machine going down under a *previous*
+            # worker, say -- can be cleared without waiting for a restart.
+            _reap()
             for _ in range(int(max(1, poll))):
                 if stopping():
                     break
@@ -367,15 +411,40 @@ def loop(sp=None, runner=None, on_report=None, once=False, drain=False,
         job_id = job.get("id", os.path.basename(running_path)[:-5])
         log("running %s" % job_id)
         spool.heartbeat(sp, job=job_id, state="running")
+
+        def cancelled(job_id=job_id):
+            return spool.cancel_requested(job_id, sp)
+
+        if cancelled():                       # asked for while it was still queued
+            spool.clear_cancel(sp)
+            spool.finish(running_path, "failed",
+                         {"error": "cancelled", "cancelled": True}, spool=sp)
+            log("cancelled %s before it started" % job_id)
+            continue
         try:
             result = run_job(job, running_path, sp=sp, runner=runner,
                              on_report=on_report, report_every=report_every,
-                             should_stop=stopping, sessions_root=sessions_root)
+                             should_stop=stopping, sessions_root=sessions_root,
+                             is_cancelled=cancelled)
+        except Cancelled:
+            # Whatever finished is kept and the session stops calling itself
+            # live; the worker takes the next job rather than shutting down.
+            session_dir = spool.read_job(running_path).get("session_dir")
+            spool.clear_cancel(sp)
+            spool.finish(running_path, "failed",
+                         {"error": "cancelled", "cancelled": True,
+                          "session_dir": session_dir}, spool=sp)
+            _settle(session_dir)
+            log("cancelled %s" % job_id)
+            continue
         except Stopping:
             # The session directory keeps whatever runs finished; the job is
             # not requeued, because re-running it would start from scratch.
+            session_dir = spool.read_job(running_path).get("session_dir")
             spool.finish(running_path, "failed",
-                         {"error": "worker stopped mid-run"}, spool=sp)
+                         {"error": "worker stopped mid-run",
+                          "session_dir": session_dir}, spool=sp)
+            _settle(session_dir)
             log("stopped %s mid-run" % job_id)
             break
         except Exception as exc:
