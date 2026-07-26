@@ -19,7 +19,14 @@ RANKING_LINE = re.compile(r"^\s*RANKING\s*:\s*(.+)$", re.M | re.I)
 TABLE_ROW = re.compile(r"^\|([^|\n]*)\|([^|\n]*)\|", re.M)
 
 # "1. Output A -- ..." or "### 3. {{C}}"
-LIST_ROW = re.compile(r"^\s*#{0,4}\s*\**(\d{1,2})\**[.)]\s+(.{0,80})$", re.M)
+#
+# The 80 characters are a window on the start of the row, not a limit on the
+# row: a judge that follows its label with a sentence of justification is
+# writing the same ranking as one that doesn't. Anchoring this to $ dropped
+# whole entries -- silently, since a short row either side of a long one still
+# parsed, so the verdict came back looking merely "incomplete" rather than
+# misread. It cost the winner of session 20260726-145930 a first-place vote.
+LIST_ROW = re.compile(r"^\s*#{0,4}\s*\**(\d{1,2})\**[.)]\s+(.{0,80})", re.M)
 
 
 def _labels_in(cell, allowed):

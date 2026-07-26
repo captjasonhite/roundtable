@@ -80,6 +80,27 @@ class ExtractTests(unittest.TestCase):
         self.assertEqual(method, "list")
         self.assertEqual(got, {"E": 1.0, "C": 2.0})
 
+    def test_list_row_with_a_long_justification_still_counts(self):
+        """A judge explaining its pick must not lose the pick.
+
+        Taken from session 20260726-145930, where the first entry ran past 80
+        characters and vanished -- the label the panel put first, dropped for
+        being the one the judge had most to say about.
+        """
+        body = ("1. **{{E}}** - Best integration of Fichtean Curve tension "
+                "through external threats and a real sense of urgency\n"
+                "2. **{{C}}** - Strong sensory escalation\n"
+                "3. **{{A}}** - Solid but less dramatic")
+        got, method, _ = ranks.extract(body, LABELS)
+        self.assertEqual(method, "list")
+        self.assertEqual(got, {"E": 1.0, "C": 2.0, "A": 3.0})
+
+    def test_a_long_row_does_not_swallow_the_next_label(self):
+        """The 80-character window is per row: . never crosses a newline."""
+        body = ("1. {{E}} %s\n2. {{C}} short\n" % ("x" * 200))
+        got, _, _ = ranks.extract(body, LABELS)
+        self.assertEqual(got, {"E": 1.0, "C": 2.0})
+
     def test_prose_alone_yields_nothing(self):
         """No table, no line -- better to report nothing than to guess."""
         body = ("A is genuinely superior to the others, and I think C is second. "
