@@ -81,7 +81,13 @@ code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.
 .barrow{display:flex;align-items:center;gap:10px;margin:0 0 6px}
 .barrow .lbl{width:345px;flex:none;font-size:13px;overflow:hidden;text-overflow:ellipsis;
   white-space:nowrap}
-.barrow .track{flex:1;min-width:80px}
+.barrow .track{flex:1;min-width:80px;position:relative}
+/* Where the score lands if the panel is resampled -- drawn over the bar, so
+   two entries whose whiskers overlap read as the tie they are. */
+.barrow .ci{position:absolute;top:3px;height:7px;border-left:2px solid var(--ink2);
+  border-right:2px solid var(--ink2);opacity:.55}
+.barrow .ci::before{content:"";position:absolute;top:2px;left:0;right:0;
+  border-top:2px solid var(--ink2)}
 .barrow .val{width:52px;flex:none;text-align:right;font-size:13px;
   font-variant-numeric:tabular-nums;color:var(--ink2)}
 .heat{border-collapse:separate;border-spacing:2px;width:auto}
@@ -347,6 +353,39 @@ def _tiles(session, result, rankings):
     return "\n".join(out)
 
 
+def _too_close(result):
+    """The sentence that stops a 0.04 gap being read as a result.
+
+    Says what the resampling covers as plainly as what it found: it varies the
+    judges, and nothing else. Run the same prompt twice and the outputs
+    themselves change, which is a larger source of movement than this and is
+    not measured here -- claiming otherwise would replace one false precision
+    with a better-dressed one.
+    """
+    tied = result.get("indistinguishable") or []
+    boot = result.get("bootstrap") or {}
+    rows = [r for r in result["standings"] if r["score"] is not None]
+    if not rows or not boot:
+        return ""
+    lead = boot.get(rows[0]["label"]) or {}
+    p = lead.get("p_best")
+    if len(tied) > 1:
+        names = ", ".join(esc(short_model(r["model"], 26)) for r in rows
+                          if r["label"] in tied)
+        body = ("<b>Too close to call at the top.</b> Resampling the judges "
+                "leaves %d entries overlapping — %s. The leader holds first "
+                "place in %s of resamples." % (len(tied), names,
+                                               "%.0f%%" % (100 * p) if p else "–"))
+    else:
+        body = ("<b>The leader is clear of the field</b> on this panel: it "
+                "holds first place in %s of judge resamples."
+                % ("%.0f%%" % (100 * p) if p else "–"))
+    return ('<p class="note warn">%s This varies the judges only. The outputs '
+            'themselves are one sample each, and rerunning the same prompt '
+            'moves the order more than this interval does — see the caveat '
+            'below the table.</p>' % body)
+
+
 def _standings(result):
     rows = [r for r in result["standings"] if r["score"] is not None]
     if not rows:
@@ -355,35 +394,60 @@ def _standings(result):
            '<h2>Panel standings</h2>',
            '<p class="note">Mean percentile across judges, self-votes removed '
            '(1.00 = best of the field, 0.00 = worst). Bars share one scale.</p>',
+           _too_close(result),
            '<div class="card">']
     for r in rows:
         width = max(1.0, 100 * r["score"])
+        band = r.get("band")
         title = "%s (%s) · score %s · mean rank %s · H2H %s" % (
             r["model"], r["mode"], C.fmt(r["score"]), C.fmt(r["mean_rank"], 1),
             C.fmt(100 * r["h2h"], 0) + "%" if r["h2h"] is not None else "–")
+        whisker = ""
+        if band and band["high"] > band["low"]:
+            title += " · resampling the panel puts it between %s and %s" % (
+                C.fmt(band["low"]), C.fmt(band["high"]))
+            whisker = ('<div class="ci" style="left:%.1f%%;width:%.1f%%"></div>'
+                       % (100 * band["low"], 100 * (band["high"] - band["low"])))
         out.append(
             '<div class="barrow" title="%s"><div class="lbl"><span class="tag">%s</span> '
             '%s <span style="color:var(--muted)">· %s</span></div>'
-            '<div class="track"><div class="bar" style="width:%.1f%%"></div></div>'
+            '<div class="track"><div class="bar" style="width:%.1f%%"></div>%s</div>'
             '<div class="val">%s</div></div>'
             % (esc(title), esc(r["label"]), esc(short_model(r["model"], 26)),
-               esc(r["mode"]), width, C.fmt(r["score"])))
+               esc(r["mode"]), width, whisker, C.fmt(r["score"])))
 
     out.append('<table style="margin-top:16px"><tr><th>Out</th><th>Model</th><th>Mode</th>'
-               '<th class="num">score</th><th class="num">mean rank</th>'
+               '<th class="num">score</th><th class="num">panel range</th>'
+               '<th class="num">p(1st)</th><th class="num">mean rank</th>'
                '<th class="num">best–worst</th><th class="num">H2H</th>'
                '<th class="num">votes</th></tr>')
     for r in rows:
+        band = r.get("band")
         out.append('<tr><td><span class="tag">%s</span></td><td class="mono">%s</td>'
                    '<td>%s</td><td class="num">%s</td><td class="num">%s</td>'
+                   '<td class="num">%s</td><td class="num">%s</td>'
                    '<td class="num">%s–%s</td><td class="num">%s</td>'
                    '<td class="num">%d</td></tr>'
                    % (esc(r["label"]), esc(r["model"]), esc(r["mode"]),
-                      C.fmt(r["score"]), C.fmt(r["mean_rank"], 1),
+                      C.fmt(r["score"]),
+                      ("%s–%s" % (C.fmt(band["low"]), C.fmt(band["high"])))
+                      if band else "–",
+                      ("%.0f%%" % (100 * band["p_best"])) if band else "–",
+                      C.fmt(r["mean_rank"], 1),
                       C.fmt(r["best_rank"], 0), C.fmt(r["worst_rank"], 0),
                       (C.fmt(100 * r["h2h"], 0) + "%") if r["h2h"] is not None else "–",
                       r["votes"]))
-    out.append("</table></div>")
+    out.append("</table>")
+    if any(r.get("band") for r in rows):
+        out.append('<p class="note">“Panel range” is a 90% interval from '
+                   'resampling the judges with replacement, and “p(1st)” is how '
+                   'often that resampled panel puts the entry first. Both '
+                   'measure disagreement <i>between judges</i>. Neither '
+                   'measures generation variance: every entry here is a single '
+                   'sample, and running the same prompt again produces '
+                   'different text that the panel may order differently. For '
+                   'that, run the prompt more than once.</p>')
+    out.append("</div>")
     return "\n".join(out)
 
 

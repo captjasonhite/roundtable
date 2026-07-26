@@ -70,6 +70,99 @@ def kendall_w(rankings):
     return 12 * s / denominator
 
 
+def _scores_from(entries, key, labels):
+    """{label: score} from one set of judge verdicts, self-votes excluded.
+
+    Split out of score() so the bootstrap can recompute the same number from a
+    resampled panel without duplicating the rule about self-votes.
+    """
+    pcts = {label: [] for label in labels}
+    for entry in entries:
+        judge = norm_model(entry["judge"])
+        entry_pcts = _percentiles(entry["ranks"])
+        for label, pct in entry_pcts.items():
+            if label in pcts and judge != norm_model(key[label]["model"]):
+                pcts[label].append(pct)
+    return {label: (st.mean(v) if v else None) for label, v in pcts.items()}
+
+
+def bootstrap(session, rankings, rounds=2000, seed=20260726):
+    """How much of the standings order survives resampling the judges?
+
+    The score is a mean over five or six opinions, and it is reported to two
+    decimal places -- which invites reading a 0.04 gap as a result. This
+    resamples the panel with replacement and reports, per entry, the range its
+    score moves over and how often it comes out on top.
+
+    ``p_best`` is the honest headline: four entries at 0.25 each means the run
+    ranked them, but the panel could not. Seeded, so a report rebuilt twice
+    says the same thing.
+    """
+    import random
+    key = session["key"]
+    labels = sorted(key)
+    entries = [r for r in rankings if len(r["ranks"]) >= 2]
+    if len(entries) < 3:
+        # Below three judges a resample is mostly the same judge repeated; the
+        # interval it produces would be theatre.
+        return None
+    rng = random.Random(seed)
+    samples = {label: [] for label in labels}
+    wins = {label: 0.0 for label in labels}
+    for _ in range(rounds):
+        panel = [entries[rng.randrange(len(entries))] for _ in entries]
+        scores = _scores_from(panel, key, labels)
+        best, top = None, []
+        for label, value in scores.items():
+            if value is None:
+                continue
+            samples[label].append(value)
+            if best is None or value > best:
+                best, top = value, [label]
+            elif value == best:
+                top.append(label)
+        for label in top:                       # a tie splits the win
+            wins[label] += 1.0 / len(top)
+    out = {}
+    for label in labels:
+        values = sorted(samples[label])
+        if not values:
+            out[label] = None
+            continue
+        out[label] = {
+            # 90%, not 95%: with six judges the tails are three resampled
+            # opinions wide and a 95% bound is mostly noise about noise.
+            "low": values[int(0.05 * (len(values) - 1))],
+            "high": values[int(0.95 * (len(values) - 1))],
+            "p_best": wins[label] / rounds,
+        }
+    return out
+
+
+def indistinguishable(result, boot):
+    """The entries at the top that the panel cannot actually separate.
+
+    -> list of labels, longest run from the top whose intervals all overlap the
+    leader's. One label means the winner really is clear of the field; four
+    means the order in the table is a coin toss dressed as a ranking.
+    """
+    if not boot:
+        return []
+    ordered = [r for r in result["standings"] if r["score"] is not None]
+    if not ordered:
+        return []
+    lead = boot.get(ordered[0]["label"])
+    if not lead:
+        return []
+    tied = []
+    for row in ordered:
+        band = boot.get(row["label"])
+        if not band or band["high"] < lead["low"]:
+            break
+        tied.append(row["label"])
+    return tied
+
+
 def score(session, rankings):
     """-> dict of standings, agreement and self-preference for one session.
 
@@ -141,7 +234,7 @@ def score(session, rankings):
     standings.sort(key=lambda r: (r["score"] is None, -(r["score"] or 0)))
 
     complete = [r["ranks"] for r in usable if r["complete"]]
-    return {
+    result = {
         "standings": standings,
         "judges": usable,
         "agreement": kendall_w(complete),
@@ -149,6 +242,12 @@ def score(session, rankings):
         "scored": bool(session["blind"]) and any(
             r["score"] is not None for r in standings),
     }
+    boot = bootstrap(session, usable) if result["scored"] else None
+    result["bootstrap"] = boot
+    result["indistinguishable"] = indistinguishable(result, boot)
+    for row in standings:                       # so a caller has it row-wise
+        row["band"] = (boot or {}).get(row["label"])
+    return result
 
 
 def disagreements(result, limit=3):

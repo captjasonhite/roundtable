@@ -462,7 +462,7 @@ fi
 # --- the request/writer helper ----------------------------------------------
 HELPER="$SDIR/.call.py"
 cat > "$HELPER" <<'PYEOF'
-import json, os, sys, time, urllib.request, urllib.error
+import json, os, re, sys, time, urllib.request, urllib.error
 
 E = os.environ
 def rd(p):
@@ -515,6 +515,64 @@ except Exception as e:
 elapsed = time.time() - t0
 tps = round(ntok / elapsed, 2) if elapsed > 0 and ntok else 0
 
+# --- ranking-line retry ------------------------------------------------------
+# Judges are asked to end with "RANKING: {{A}} > {{B}} > ...", and some never
+# do: across the first ten sessions one judge missed it every single time, so a
+# fifth of all verdicts were being recovered by regex from prose instead of
+# read from a line the judge wrote on purpose. Salvage parsers are where the
+# silent errors live -- one of them dropped a first-place vote for months.
+#
+# So: if the line is missing or short, ask again. Same loaded model, same
+# conversation, one extra call of a few hundred tokens -- no reload. The retry
+# asks for the line ONLY; the judging already happened in the first reply and
+# is not revisited. When it works, the line is spliced in and the file records
+# ranking_retry: true, because a number obtained on the second ask should not
+# look identical to one obtained on the first.
+RANKING_RE = re.compile(r"^\s*RANKING\s*:\s*(.+)$", re.M | re.I)
+
+
+def ranking_labels(text):
+    m = RANKING_RE.search(text or "")
+    return set(re.findall(r"\{\{\s*([A-Z])\s*\}\}", m.group(1))) if m else set()
+
+
+want = {l.strip() for l in E.get("REQUIRE_LABELS", "").split(",") if l.strip()}
+retried = False
+if want and not err and ranking_labels(content) != want:
+    tags = " > ".join("{{%s}}" % l for l in sorted(want))
+    follow = ("Reply with ONE line and nothing else — no preamble, no "
+              "explanation, no code fence. Put the %d outputs you just judged "
+              "in order, best first, using the tags exactly as written with "
+              "braces, each tag exactly once:\n\nRANKING: %s"
+              % (len(want), tags))
+    retry_body = dict(body)
+    retry_body["messages"] = msgs + [
+        {"role": "assistant", "content": content},
+        {"role": "user", "content": follow},
+    ]
+    # Enough room for a thinking model to reason its way to one line.
+    retry_body["max_tokens"] = 1024
+    try:
+        rr = urllib.request.Request(
+            "http://127.0.0.1:%s/v1/chat/completions" % E["PORT"],
+            data=json.dumps(retry_body).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(rr, timeout=float(E["REQUEST_TIMEOUT"])) as r:
+            rdata = json.load(r)
+        rmsg = rdata["choices"][0]["message"]
+        # A thinking model sometimes states the line in its reasoning and then
+        # answers in prose; either place is the judge's own answer.
+        for text in (rmsg.get("content") or "", rmsg.get("reasoning_content") or ""):
+            if ranking_labels(text) == want:
+                line = "RANKING: " + RANKING_RE.search(text).group(1).strip()
+                # Drop the malformed original, or the reader finds it first.
+                content = RANKING_RE.sub("", content).rstrip() + "\n\n" + line
+                ntok += (rdata.get("usage") or {}).get("completion_tokens", 0) or 0
+                retried = True
+                break
+    except Exception:
+        pass                       # a failed retry is the status quo, not a failure
+
 def esc(s):
     return json.dumps(s)  # safe YAML scalar: JSON strings are valid YAML
 
@@ -534,6 +592,8 @@ with open(E["OUT_FILE"], "w") as f:
     f.write("tokens_per_sec: %s\n" % tps)
     f.write("elapsed_sec: %d\n"  % round(elapsed))
     f.write("error: %s\n"        % (esc(err) if err else "null"))
+    if retried:
+        f.write("ranking_retry: true\n")
     f.write("---\n\n")
     if err:
         f.write("## Error\n\n```\n%s\n```\n" % err)
@@ -726,6 +786,7 @@ do_run() {
     DRY_BASE="$DRY_BASE" DRY_ALLOWED_LENGTH="$DRY_ALLOWED_LENGTH" \
     DRY_PENALTY_LAST_N="$DRY_PENALTY_LAST_N" \
     ACTUAL_CTX="${ACTUAL_CTX:-}" REQUEST_TIMEOUT="$REQUEST_TIMEOUT" \
+    REQUIRE_LABELS="${REQUIRE_LABELS:-}" \
     python3 "$HELPER" 2>&1
   )"
   RC=$?
@@ -985,6 +1046,14 @@ if [[ "$RUN_SUMMARY" == "1" && "$OK_RUNS" -gt 0 ]]; then
   # judge total is known; harmlessly rewrites the same number otherwise.
   printf '%s\n' "${#UNIQ_MODELS[@]}" > "$SDIR/.expected-judges"
   : > "$SDIR/.summary-system.txt"   # no system prompt: SUMMARIZE.md is self-contained
+  # The tags this session used. Set only for the judge pass: it turns on the
+  # helper's ranking-line retry, and only a judge is asked for a ranking line.
+  REQUIRE_LABELS=""
+  if [[ -f "$SDIR/SUMMARIZE-KEY.md" ]]; then
+    REQUIRE_LABELS="$(grep -oE '\{\{[A-Z]\}\}' "$SDIR/SUMMARIZE-KEY.md" \
+                        | tr -d '{}' | sort -u | paste -sd, -)"
+    [[ -n "$REQUIRE_LABELS" ]] && echo "  (judges will be re-asked if they skip the RANKING line: $REQUIRE_LABELS)"
+  fi
   S_OK=0; S_FAIL=0
   for j in "${!UNIQ_MODELS[@]}"; do
     M="${UNIQ_MODELS[$j]}"
