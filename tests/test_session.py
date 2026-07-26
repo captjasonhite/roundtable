@@ -3,6 +3,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -53,6 +54,49 @@ class SessionShapeTests(unittest.TestCase):
     def write(self, name, text):
         with open(os.path.join(self.dir, name), "w", encoding="utf-8") as f:
             f.write(text)
+
+    def test_started_comes_from_the_directory_stamp(self):
+        """Not the directory mtime: every finished run writes into the session
+        and would push that forward."""
+        sdir = os.path.join(self.dir, "20260723-211143")
+        os.makedirs(sdir)
+        self.assertEqual(session_mod.started(sdir),
+                         time.mktime(time.strptime("20260723-211143",
+                                                   "%Y%m%d-%H%M%S")))
+
+    def test_touched_ignores_files_a_rebuild_rewrites(self):
+        """report.html and scores.json are rewritten into the session every time
+        the page is regenerated -- counting them would make a session that died
+        last week look alive, and inflate how long it took to run."""
+        self.write("01_x_alpha_thinking.md", RESULT)
+        old = 1_700_000_000.0
+        os.utime(os.path.join(self.dir, "01_x_alpha_thinking.md"), (old, old))
+        self.write("report.html", "<html></html>")   # written just now
+        self.write("scores.json", "{}")
+        self.assertEqual(session_mod.touched(self.dir), old)
+
+    def test_touched_follows_a_log_of_a_run_still_in_flight(self):
+        """The run writing right now has no result file yet; its log is the only
+        sign the queue is still alive."""
+        self.write("01_x_alpha_thinking.md", RESULT)
+        old = 1_700_000_000.0
+        os.utime(os.path.join(self.dir, "01_x_alpha_thinking.md"), (old, old))
+        os.makedirs(os.path.join(self.dir, "logs"))
+        self.write(os.path.join("logs", "02_beta_thinking.log"), "loading…")
+        self.assertGreater(session_mod.touched(self.dir), old)
+
+    def test_expected_counts_are_none_when_the_runner_never_wrote_them(self):
+        self.write("01_x_alpha_thinking.md", RESULT)
+        data = session_mod.load(self.dir)
+        self.assertIsNone(data["expected_runs"])
+        self.assertIsNone(data["expected_judges"])
+
+    def test_expected_counts_are_read(self):
+        self.write("01_x_alpha_thinking.md", RESULT)
+        self.write(".expected-runs", "6\n")
+        self.write(".expected-judges", "3\n")
+        data = session_mod.load(self.dir)
+        self.assertEqual((data["expected_runs"], data["expected_judges"]), (6, 3))
 
     def test_round3_file_is_not_read_as_a_run(self):
         """A round3_*.md has the same frontmatter shape as a benchmark result --

@@ -138,6 +138,21 @@ def build_meta_command(model_slug, system_prompt, user_prompt, session_dir,
     return argv, env
 
 
+def _expect_meta(session_dir, wanted):
+    """Note in the session whether a Round 3 run is still to come.
+
+    One number in ``.expected-meta``, matching the ``.expected-*`` counts the
+    bench script writes, so the report can count the synthesis as the judge run
+    it is. Best-effort: a session that can't be written to is not a reason to
+    fail a job that has already produced its results.
+    """
+    try:
+        spool.write_atomic(os.path.join(session_dir, ".expected-meta"),
+                           "1\n" if wanted else "0\n")
+    except OSError:
+        pass
+
+
 def run_meta_summary(job, session_dir, sp=None, runner=None, log=None):
     """Round 3, after Round 1+2 have finished. -> True if it ran, False if skipped.
 
@@ -271,6 +286,11 @@ def run_job(job, running_path, sp=None, runner=None, on_report=None,
 
     ran_meta_summary = False
     if code == 0 and session_dir:
+        # Round 3 is the worker's step, not the bench script's, so the bench
+        # script can't have counted it. Record it here — between the last judge
+        # finishing and Round 3 starting — or the report shows every run
+        # complete while a model is still loading for the synthesis.
+        _expect_meta(session_dir, job.get("meta_summary", True))
         if on_report:
             on_report(session_dir, True)          # Round 1+2 visible while Round 3 loads
         with open(log_path, "a", encoding="utf-8") as log:
@@ -281,11 +301,21 @@ def run_job(job, running_path, sp=None, runner=None, on_report=None,
 
         ran_meta_summary = run_meta_summary(job, session_dir, sp=sp, runner=runner,
                                             log=_log_to_main)
+        if not ran_meta_summary:
+            # Skipped after all (not blind, nothing scored, no top model): take
+            # the pending synthesis back off the count rather than leaving the
+            # report one run short of complete forever.
+            _expect_meta(session_dir, False)
     if session_dir and on_report:
         on_report(session_dir, False)             # final write, no refresh tag
 
     return {"exit_code": code,
             "meta_summary": ran_meta_summary,
+            # What was asked for, as opposed to what happened: finish() merges
+            # this record over the job, so without it a Round 3 that was wanted
+            # but skipped would look like a job that never wanted one -- and
+            # rerunning from the record would quietly drop it.
+            "meta_summary_requested": bool(job.get("meta_summary", True)),
             "session_dir": session_dir,
             "log": log_path,
             "elapsed_sec": round(time.time() - started, 1)}

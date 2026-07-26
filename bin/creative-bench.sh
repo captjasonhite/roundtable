@@ -435,6 +435,30 @@ if [[ $ASSUME_YES -eq 0 && -t 0 ]]; then
 fi
 fi
 
+# Every model judges once, so the judge count is the queue with modes collapsed.
+# Computed here rather than in pass 2 because the progress bar needs the total
+# before the first run starts, not after the last one.
+UNIQ_MODELS=(); for m in "${QUEUE_MODEL[@]}"; do
+  seen=0; for u in ${UNIQ_MODELS[@]+"${UNIQ_MODELS[@]}"}; do [[ "$u" == "$m" ]] && seen=1; done
+  (( seen )) || UNIQ_MODELS+=("$m")
+done
+
+# How many runs are coming. A run in flight has written no result file yet, so
+# this is the only way the report can say "3 of 6" instead of just "3" — see
+# session.load(). Judges are only knowable up front when --summarize/--no-summarize
+# said so on the command line (the worker always passes one); left unwritten
+# when the question is still going to be asked interactively after pass 1, and
+# written for real when pass 2 starts.
+if [[ -z "$SUMMARIZE_ONLY_DIR" && -z "$META_SUMMARY_DIR" ]]; then
+  printf '%s\n' "${#QUEUE_MODEL[@]}" > "$SDIR/.expected-runs"
+fi
+if [[ -z "$META_SUMMARY_DIR" ]]; then      # Round 3 appends to a finished session
+  case "$SUMMARIZE_ARG" in
+    1) printf '%s\n' "${#UNIQ_MODELS[@]}" > "$SDIR/.expected-judges" ;;
+    0) printf '0\n' > "$SDIR/.expected-judges" ;;
+  esac
+fi
+
 # --- the request/writer helper ----------------------------------------------
 HELPER="$SDIR/.call.py"
 cat > "$HELPER" <<'PYEOF'
@@ -588,13 +612,19 @@ do_run() {
     [[ -n "$C_PRES"  && -z "$PRESENCE_PENALTY_USER_SET" ]] && R_PRES="$C_PRES"
   fi
 
-  # Qwen3.6 + MTP detection (same probe as code-stack.sh: filename for the
-  # family, GGUF metadata for the nextn layers — many quants drop them and
-  # llama-server aborts if asked for a draft it can't build).
-  local QWEN36=0 HAS_MTP=0
-  if [[ "${MODEL,,}" =~ (qwen|qwopus)[-._\ ]*3[-._\ ]*6 ]]; then
+  # Qwen3.6 + MTP detection (same probe as code-stack.sh: the filename is a fast
+  # path, the GGUF architecture key is the real test — derivatives that drop
+  # "Qwen" from the name, e.g. Ornith-1.0-35B, report qwen35moe and would
+  # otherwise bench without MTP, which skews tok/s against their twins. The
+  # nextn layers are probed too: many quants drop them and llama-server aborts
+  # if asked for a draft it can't build).
+  local QWEN36=0 HAS_MTP=0 KEYS=""
+  KEYS="$(head -c 64000000 "$MODEL" | strings -n 6 \
+            | grep -oiE '^[a-z0-9._]+\.(block_count|nextn_predict_layers)' || true)"
+  if [[ "${MODEL,,}" =~ (qwen|qwopus)[-._\ ]*3[-._\ ]*6 ]] \
+     || grep -qiE '^qwen3[5-9](moe|vl|vlmoe)?\.' <<<"$KEYS"; then
     QWEN36=1
-    if head -c 64000000 "$MODEL" | strings -n 6 | grep -i 'nextn_predict_layers' >/dev/null; then
+    if grep -qi 'nextn_predict_layers' <<<"$KEYS"; then
       HAS_MTP=1
     fi
   fi
@@ -932,10 +962,7 @@ echo "  ✓ wrote SUMMARIZE.md ($(wc -c <"$SDIR/SUMMARIZE.md") bytes)"
 # --- pass 2: let every model judge the results ------------------------------
 # Feeds SUMMARIZE.md back to each model that was benchmarked, so you get one
 # comparison per judge rather than trusting a single model's taste.
-UNIQ_MODELS=(); for m in "${QUEUE_MODEL[@]}"; do
-  seen=0; for u in ${UNIQ_MODELS[@]+"${UNIQ_MODELS[@]}"}; do [[ "$u" == "$m" ]] && seen=1; done
-  (( seen )) || UNIQ_MODELS+=("$m")
-done
+# UNIQ_MODELS was computed before pass 1, so the progress bar knew the total.
 
 RUN_SUMMARY="$SUMMARIZE_ARG"
 if [[ -z "$RUN_SUMMARY" && -t 0 ]]; then
@@ -944,10 +971,19 @@ if [[ -z "$RUN_SUMMARY" && -t 0 ]]; then
   [[ "${s,,}" == "y" || "${s,,}" == "yes" ]] && RUN_SUMMARY=1 || RUN_SUMMARY=0
 fi
 RUN_SUMMARY="${RUN_SUMMARY:-0}"
+# Not judging settles the total too — otherwise the report sits at "0 of 6
+# judges, 6 to go" forever on a session that is actually finished. Covers both
+# declining the prompt and having no usable result for a judge to read.
+if [[ "$RUN_SUMMARY" != "1" || "$OK_RUNS" -eq 0 ]]; then
+  printf '0\n' > "$SDIR/.expected-judges"
+fi
 
 if [[ "$RUN_SUMMARY" == "1" && "$OK_RUNS" -gt 0 ]]; then
   echo
   echo "─── summary pass: ${#UNIQ_MODELS[@]} judges, $SUMMARY_MODE, temp $SUMMARY_TEMP ───"
+  # Answered interactively after pass 1, so this may be the first time the
+  # judge total is known; harmlessly rewrites the same number otherwise.
+  printf '%s\n' "${#UNIQ_MODELS[@]}" > "$SDIR/.expected-judges"
   : > "$SDIR/.summary-system.txt"   # no system prompt: SUMMARIZE.md is self-contained
   S_OK=0; S_FAIL=0
   for j in "${!UNIQ_MODELS[@]}"; do

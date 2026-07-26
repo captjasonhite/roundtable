@@ -200,6 +200,101 @@ class ReportRenderTests(unittest.TestCase):
     def test_no_verdicts_section_when_no_judges(self):
         self.assertEqual(report._verdicts_section({"judges": []}, {"standings": []}), "")
 
+    def test_tiles_show_done_over_total(self):
+        self.write("01_x_alpha_thinking.md", RUN)
+        self.write(".expected-runs", "4\n")
+        self.write(".expected-judges", "2\n")
+        _, html = self.render()
+        self.assertIn("Output runs", html)
+        self.assertIn(">1/4<", html)
+        self.assertIn("Judge runs", html)
+        self.assertIn(">0/2<", html)
+        self.assertIn("3 to go", html)
+
+    def test_totals_fall_back_to_what_is_on_disk(self):
+        """An older session has no expected-* files; it reads 1/1, not 1/0."""
+        self.write("01_x_alpha_thinking.md", RUN)
+        data, html = self.render()
+        self.assertEqual(report._counts(data), (1, 1, 0, 0))
+        self.assertIn(">1/1<", html)
+
+    def test_total_never_below_what_exists(self):
+        """A stray extra result file must not render '2/1'."""
+        self.write("01_x_alpha_thinking.md", RUN)
+        self.write("02_x_beta_thinking.md", RUN_B)
+        self.write(".expected-runs", "1\n")
+        data, _ = self.render()
+        self.assertEqual(report._counts(data)[:2], (2, 2))
+
+    def test_progress_bar_has_a_cell_per_run_and_an_eta(self):
+        self.write("01_x_alpha_thinking.md", RUN)
+        self.write(".expected-runs", "4\n")
+        self.write(".expected-judges", "2\n")
+        data = session_mod.load(self.dir)
+        # 10 minutes in, 1 of 6 units done -> 10 min each, 50 min to go.
+        data["started"] = data["touched"] = None
+        now = 1_800_000_000.0
+        data["started"], data["touched"] = now - 600, now - 60
+        bar = report._progress(data, now=now)
+        self.assertEqual(bar.count('class="c '), 6)
+        self.assertEqual(bar.count("c done"), 1)
+        self.assertEqual(bar.count("c pend"), 5)
+        self.assertIn("<b>1 of 6</b>", bar)
+        self.assertIn("5 to go", bar)
+        self.assertIn("50 min", bar)
+
+    def test_no_eta_for_a_session_nobody_is_writing_to(self):
+        """A queue that died leaves its counts short forever -- an ETA computed
+        from them would be fiction, so the bar says so instead."""
+        self.write("01_x_alpha_thinking.md", RUN)
+        self.write(".expected-runs", "4\n")
+        data = session_mod.load(self.dir)
+        now = 1_800_000_000.0
+        data["started"] = now - 86400
+        data["touched"] = now - 86000
+        self.assertIsNone(report._eta(data, 1, 4, now=now))
+        self.assertIn("stopped", report._progress(data, now=now))
+
+    def test_finished_session_reports_how_long_it_took(self):
+        self.write("01_x_alpha_thinking.md", RUN)
+        data = session_mod.load(self.dir)
+        now = 1_800_000_000.0
+        data["started"], data["touched"] = now - 3600, now - 60
+        bar = report._progress(data, now=now)
+        self.assertIn("<b>1 of 1</b>", bar)
+        self.assertIn("took 59 min", bar)
+        self.assertNotIn("ETA", bar)
+
+    def test_bar_sits_directly_under_the_tiles(self):
+        self.write("01_x_alpha_thinking.md", RUN)
+        _, html = self.render()
+        self.assertGreater(html.index('class="prog"'), html.index('class="tiles"'))
+        self.assertLess(html.index('class="prog"'), html.index("<footer>"))
+
+    def test_round3_counts_as_the_last_judge_run(self):
+        """It loads a model and generates like any judge; a report that ignored
+        it would say 'complete' with 17 GB still loading."""
+        self.write("01_x_alpha_thinking.md", RUN)
+        self.write("summary_20260101-000000_alpha-7B.md", VERDICT)
+        self.write(".expected-runs", "1\n")
+        self.write(".expected-judges", "1\n")
+        self.write(".expected-meta", "1\n")
+        data = session_mod.load(self.dir)
+        self.assertEqual(report._counts(data), (1, 1, 1, 2))
+        bar = report._progress(data, now=1_800_000_000.0)
+        self.assertIn("<b>2 of 3</b>", bar)
+        self.assertIn("synthesis (round 3) — not run yet", bar)
+
+    def test_round3_present_counts_as_done(self):
+        self.write("01_x_alpha_thinking.md", RUN)
+        self.write("summary_20260101-000000_alpha-7B.md", VERDICT)
+        self.write("round3_20260101-000000_alpha-7B.md", RUN)
+        data = session_mod.load(self.dir)
+        self.assertEqual(report._counts(data), (1, 1, 2, 2))
+        bar = report._progress(data, now=1_800_000_000.0)
+        self.assertIn("<b>3 of 3</b>", bar)
+        self.assertNotIn("not run yet", bar)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,6 +15,7 @@ Nothing here knows about HTML or scoring -- it just turns files into dicts.
 """
 import os
 import re
+import time
 
 
 def parse_front(text):
@@ -185,6 +186,65 @@ def load(sdir):
         "system_prompt": _read(os.path.join(sdir, "system-prompt.txt")),
         "user_prompt": _read(os.path.join(sdir, "user-prompt.txt")),
         # A run still in flight has no result file yet, so "how many are coming"
-        # is unknowable from disk alone; the worker writes it when it knows.
+        # is unknowable from disk alone; creative-bench.sh writes both counts
+        # when it knows them (judges only once --summarize is settled, which on
+        # an interactive run happens after the last output run).
         "expected_runs": _num(_read(os.path.join(sdir, ".expected-runs")).strip()),
+        "expected_judges": _num(_read(os.path.join(sdir, ".expected-judges")).strip()),
+        # Round 3 is the worker's step, so the worker writes this one.
+        "expected_meta": _num(_read(os.path.join(sdir, ".expected-meta")).strip()),
+        "started": started(sdir),
+        "touched": touched(sdir),
     }
+
+
+def started(sdir):
+    """-> epoch seconds the session began, or None.
+
+    The directory name is a local-time stamp (creative-bench.sh: date
+    +%Y%m%d-%H%M%S); its mtime is not usable, since every finished run writes
+    into the directory and pushes it forward.
+    """
+    name = os.path.basename(os.path.abspath(sdir))
+    try:
+        return time.mktime(time.strptime(name[:15], "%Y%m%d-%H%M%S"))
+    except (ValueError, OverflowError):
+        try:
+            return os.path.getctime(sdir)
+        except OSError:
+            return None
+
+
+def touched(sdir):
+    """-> epoch seconds the runner last wrote something, or None.
+
+    How a reader tells "still running" from "stopped half way": a queue that
+    died leaves its counts short forever, and an ETA computed from it would be
+    fiction.
+
+    Deliberately NOT the newest file in the directory. report.html and
+    scores.json are rewritten into the session by every rebuild, and the
+    de-anonymiser rewrites deanon/ -- reading those would make a session that
+    died last week look like it was alive a second ago, and would count a much
+    later rebuild as part of how long the session took to run. Only files a run
+    itself produces count: the result markdown, and the per-run logs, which tick
+    while a run is still in flight and has no result file yet.
+    """
+    candidates = []
+    for name in os.listdir(sdir):
+        if _is_result(name) or name.startswith(("summary_", "round3_")):
+            candidates.append(os.path.join(sdir, name))
+    logs = os.path.join(sdir, "logs")
+    try:
+        candidates += [os.path.join(logs, n) for n in os.listdir(logs)]
+    except OSError:
+        pass
+    newest = None
+    for path in candidates:
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if newest is None or mtime > newest:
+            newest = mtime
+    return newest

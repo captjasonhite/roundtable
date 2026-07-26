@@ -112,6 +112,21 @@ code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.
 .dbar .half.r b{border-radius:0 4px 4px 0}
 .dbar .val{width:52px;flex:none;text-align:right;color:var(--ink2);
   font-variant-numeric:tabular-nums}
+/* Sits directly under the tiles and spans the same width, so the row of
+   numbers and the bar that explains them read as one block. */
+.prog{background:var(--surface);border:1px solid var(--border);border-radius:10px;
+  padding:14px 16px;margin:0 0 18px}
+.prog .track{display:flex;gap:2px;align-items:stretch;height:16px}
+.prog .c{flex:1;min-width:3px;border-radius:3px;display:block}
+.prog .c.done{background:var(--series)}
+.prog .c.fail{background:var(--pos)}
+.prog .c.pend{background:var(--zero);border:1px solid var(--border)}
+.prog .gap{flex:none;width:10px}
+.prog .foot{display:flex;justify-content:space-between;gap:12px;margin-top:7px;
+  font-size:12.5px;color:var(--ink2)}
+.prog .foot b{color:var(--ink);font-weight:600}
+.prog .eta{font-variant-numeric:tabular-nums;white-space:nowrap}
+.prog .at{color:var(--muted)}
 details{margin:10px 0 0;font-size:13.5px}
 summary{cursor:pointer;color:var(--ink2);display:flex;align-items:center;gap:8px}
 summary .sumtext{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -151,6 +166,153 @@ def _bin(rank, n):
     return max(0, min(6, int(round(p * 6))))
 
 
+# A session whose newest file is older than this isn't being written to any
+# more: the queue was interrupted or the machine went to sleep. Its counts stay
+# short forever, so an ETA derived from them would be fiction — the bar says
+# "stopped" instead of guessing. Generous, because one 35B judge run at 16k
+# tokens plus its model load is minutes, not seconds.
+STALE_AFTER = 1800
+
+
+def _has_meta(session):
+    """Is a Round 3 synthesis part of this session -- done or still coming?"""
+    return bool(session.get("meta_summary") or session.get("expected_meta"))
+
+
+def _counts(session):
+    """-> (runs_done, runs_total, judges_done, judges_total).
+
+    Totals come from the counts creative-bench.sh drops in the session dir; they
+    fall back to what's on disk, so an old session (or one whose runner never
+    wrote them) reports "6/6" rather than "6/0". Never reports fewer total than
+    done, so a stray extra result file can't produce "7/6".
+
+    Round 3 -- the top model reading the panel's verdicts and writing the final
+    synthesis -- counts as a judge run: it loads a model and generates, exactly
+    like the six before it, and a report that ignored it would say "complete"
+    with 17 GB still loading.
+    """
+    runs_done = len(session["runs"])
+    judges_done = len(session["judges"])
+    expected_runs = session.get("expected_runs")
+    expected_judges = session.get("expected_judges")
+    runs_total = max(runs_done, int(expected_runs or 0) or runs_done)
+    judges_total = max(judges_done, int(expected_judges or 0) or judges_done)
+
+    meta_done = 1 if session.get("meta_summary") else 0
+    expected_meta = session.get("expected_meta")
+    meta_total = meta_done if expected_meta is None else int(expected_meta)
+    judges_done += meta_done
+    judges_total += max(meta_done, meta_total)
+    return runs_done, runs_total, judges_done, judges_total
+
+
+def fmt_dur(seconds):
+    """Seconds -> '4 min', '1 h 12 min', '< 1 min'. Coarse on purpose."""
+    if seconds is None:
+        return ""
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return "< 1 min"
+    minutes = int(round(seconds / 60.0))
+    if minutes < 60:
+        return "%d min" % minutes
+    return "%d h %02d min" % divmod(minutes, 60)
+
+
+def _eta(session, done, total, now=None):
+    """-> seconds until the queue finishes, or None when that can't be honest.
+
+    A flat average over completed units: total wall time so far divided by the
+    units that produced it, which is deliberately not the sum of the runs' own
+    ``elapsed`` — that measures generation only, while half of a run's real cost
+    is loading ~17 GB of weights onto the GPU and letting them release again.
+    Judges and output runs are averaged together; they aren't the same length,
+    so this is a working estimate, not a promise, and it's labelled as one.
+    """
+    now = now or time.time()
+    started, touched = session.get("started"), session.get("touched")
+    if not started or done <= 0 or done >= total:
+        return None
+    if now - started <= 0 or (touched and now - touched > STALE_AFTER):
+        return None
+    return (now - started) / done * (total - done)
+
+
+def _progress(session, now=None):
+    """The full-width bar under the tiles: one cell per run, plus an ETA.
+
+    Reads the same as a finished session or a running one -- what's done, what's
+    left, how long the rest will take -- so it needs no separate "running" mode;
+    an ETA simply stops being offered once there's nothing left to wait for.
+    """
+    now = now or time.time()
+    runs_done, runs_total, judges_done, judges_total = _counts(session)
+    total = runs_total + judges_total
+    done = runs_done + judges_done
+    if not total:
+        return ""
+
+    # Round 3 is the last judge run, so it belongs at the end of the judge group
+    # rather than in a group of its own.
+    judge_items = list(session["judges"])
+    if session.get("meta_summary"):
+        judge_items.append(session["meta_summary"])
+
+    failed = sum(1 for r in session["runs"] if r["error"])
+    failed += sum(1 for j in judge_items if j["error"])
+
+    cells = []
+    for group, items, group_total, noun in (
+            ("run", session["runs"], runs_total, "output run"),
+            ("judge", judge_items, judges_total, "judge run")):
+        for i in range(group_total):
+            item = items[i] if i < len(items) else None
+            last = (group == "judge" and i == group_total - 1)
+            what = "synthesis (round 3)" if last and _has_meta(session) else \
+                   "%s %d" % (noun, i + 1)
+            if item is None:
+                cells.append('<i class="c pend" title="%s — not run yet"></i>'
+                             % esc(what))
+                continue
+            name = item.get("model") or item.get("judge") or ""
+            label = "%s · %s" % (what, short_model(name, 34))
+            if group == "run" and item.get("mode"):
+                label += " (%s)" % item["mode"]
+            if item.get("elapsed"):
+                label += " · %s" % fmt_dur(item["elapsed"])
+            cls = "c fail" if item["error"] else "c done"
+            if item["error"]:
+                label += " · failed"
+            cells.append('<i class="%s" title="%s"></i>' % (cls, esc(label)))
+        if group == "run" and judges_total:
+            cells.append('<i class="gap"></i>')
+
+    left = ["<b>%d of %d</b> runs complete" % (done, total)]   # counts, nothing to escape
+    if failed:
+        left.append("%d failed" % failed)
+    if done < total:
+        left.append("%d to go" % (total - done))
+
+    right = ""
+    eta = _eta(session, done, total, now)
+    if eta is not None:
+        right = ("ETA &asymp; %s <span class=\"at\">(about %s)</span>"
+                 % (fmt_dur(eta), time.strftime("%H:%M", time.localtime(now + eta))))
+    elif done >= total:
+        if session.get("started") and session.get("touched"):
+            right = "took %s" % fmt_dur(session["touched"] - session["started"])
+        else:
+            right = "complete"
+    elif session.get("touched") and now - session["touched"] > STALE_AFTER:
+        right = ("stopped &mdash; nothing written for %s"
+                 % fmt_dur(now - session["touched"]))
+
+    return ('<div class="prog"><div class="track">%s</div>'
+            '<div class="foot"><span>%s</span><span class="eta">%s</span></div></div>'
+            % ("".join(cells), " · ".join(left), right))
+
+
 def _tiles(session, result, rankings):
     runs = session["runs"]
     ok = [r for r in runs if not r["error"]]
@@ -161,10 +323,15 @@ def _tiles(session, result, rankings):
     if top:
         tiles.append(("Panel pick", short_model(top["model"], 30),
                       "%s · score %s" % (top["mode"], C.fmt(top["score"]))))
-    tiles.append(("Runs", str(len(ok)),
-                  "%d failed" % (len(runs) - len(ok)) if len(ok) != len(runs) else "all completed"))
-    tiles.append(("Judges", str(len(result["judges"])),
-                  "%d ranked every output" % result["agreement_n"]))
+    runs_done, runs_total, judges_done, judges_total = _counts(session)
+    run_hint = "all completed" if runs_done >= runs_total else "%d to go" % (runs_total - runs_done)
+    if len(ok) != len(runs):
+        run_hint = "%d failed" % (len(runs) - len(ok))
+    tiles.append(("Output runs", "%d/%d" % (runs_done, runs_total), run_hint))
+    tiles.append(("Judge runs", "%d/%d" % (judges_done, judges_total),
+                  "%d ranked every output" % result["agreement_n"]
+                  if judges_done >= judges_total and judges_total
+                  else "%d to go" % (judges_total - judges_done)))
     if result["agreement"] is not None:
         tiles.append(("Agreement", C.fmt(result["agreement"]),
                       C.agreement_label(result["agreement"])))
@@ -573,6 +740,7 @@ def render(session, result, rankings, running=False, refresh=15,
     # (tokens, tok/s, how each verdict was parsed) is real but secondary --
     # it goes at the bottom, after Prompt.
     body.append(_tiles(session, result, rankings))
+    body.append(_progress(session))
     body.append(_meta_summary(session, result))
     body.append(_outputs_section(session, result))
     body.append(_standings(result))
