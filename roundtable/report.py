@@ -380,10 +380,10 @@ def _too_close(result):
         body = ("<b>The leader is clear of the field</b> on this panel: it "
                 "holds first place in %s of judge resamples."
                 % ("%.0f%%" % (100 * p) if p else "–"))
-    return ('<p class="note warn">%s This varies the judges only. The outputs '
-            'themselves are one sample each, and rerunning the same prompt '
-            'moves the order more than this interval does — see the caveat '
-            'below the table.</p>' % body)
+    return ('<p class="note warn">%s That is a floor, not a margin: it '
+            'resamples the verdicts already on file, and re-running the judges '
+            'moves the panel further than resampling them does — see the '
+            'caveat below the table.</p>' % body)
 
 
 def _standings(result):
@@ -440,13 +440,16 @@ def _standings(result):
     out.append("</table>")
     if any(r.get("band") for r in rows):
         out.append('<p class="note">“Panel range” is a 90% interval from '
-                   'resampling the judges with replacement, and “p(1st)” is how '
-                   'often that resampled panel puts the entry first. Both '
-                   'measure disagreement <i>between judges</i>. Neither '
-                   'measures generation variance: every entry here is a single '
-                   'sample, and running the same prompt again produces '
-                   'different text that the panel may order differently. For '
-                   'that, run the prompt more than once.</p>')
+                   'resampling <i>these</i> verdicts with replacement, and '
+                   '“p(1st)” is how often the resampled panel puts the entry '
+                   'first. Read both as lower bounds. They take each verdict '
+                   'as fixed, and a judge re-run at a different seed does not '
+                   'write the same verdict: judging one identical set of six '
+                   'outputs five times produced three different winners '
+                   '(measured 2026-07-26). Nor does any of this cover '
+                   'generation variance — every entry is a single sample, and '
+                   'the same prompt run again produces different text. For '
+                   'either, run it more than once.</p>')
     out.append("</div>")
     return "\n".join(out)
 
