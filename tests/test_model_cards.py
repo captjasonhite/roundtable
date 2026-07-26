@@ -15,7 +15,24 @@ class LoadAndMatchTests(unittest.TestCase):
     def test_bundled_cards_load(self):
         cards = model_cards.load(user="/nonexistent")
         ids = {c["id"] for c in cards}
-        self.assertEqual(ids, {"gemma4", "apex", "qwen3.6", "cydonia"})
+        self.assertEqual(ids, {"gemma4", "ornith", "apex", "qwen3.6", "cydonia"})
+
+    def test_ornith_wins_over_apex(self):
+        """Ornith's quants are named ...-APEX, so card order decides the match.
+
+        Both SC117 files carry APEX in the name; if the ornith card ever slips
+        below the apex one in the bundled file, Ornith silently inherits the
+        other model's profile (presence 1.5) and the two stop being separately
+        editable on the web page.
+        """
+        cards = model_cards.load(user="/nonexistent")
+        ornith = model_cards.match(
+            "Ornith-1.0-35B-Heretic-MTP-APEX-I-Compact", cards)
+        apex = model_cards.match(
+            "Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-I-Compact",
+            cards)
+        self.assertEqual(ornith["id"], "ornith")
+        self.assertEqual(apex["id"], "apex")
 
     def test_match_is_case_insensitive_substring(self):
         card = model_cards.match("Gemma4-26B-A4B-QAT-Uncensored")

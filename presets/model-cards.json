@@ -11,6 +11,16 @@
       "nothinking": {"temp": 0.6, "top_p": 0.9, "top_k": 64, "min_p": 0.05, "repeat": 1.1, "presence": 0}
     },
     {
+      "id": "ornith",
+      "match": "ornith",
+      "title": "Ornith",
+      "thinks": true,
+      "source": "GGUF metadata (general.sampling.*) of Ornith-1.0-35B-Heretic-MTP-APEX, read 2026-07-26",
+      "note": "Must stay ABOVE the apex card: match() takes the first hit and this file's quants are named ...-APEX. deepreinforce-ai/Ornith-1.0-35B is a Qwen3.6-35B-A3B derivative (arch qwen35moe, identical dims/tokenizer), so the numbers follow the Qwen3.6 card — but temp/top_p/top_k here are the model's OWN embedded sampling hints, not inherited. presence is 0: SC117's 1.5 is documented for their Qwen3.6 APEX, not for this base, and no Ornith card was consulted. No-thinking profile is inferred from the Qwen3.6 instruct guidance.",
+      "thinking": {"temp": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "repeat": 1.0, "presence": 0},
+      "nothinking": {"temp": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0.0, "repeat": 1.0, "presence": 0}
+    },
+    {
       "id": "apex",
       "match": "apex",
       "title": "APEX",

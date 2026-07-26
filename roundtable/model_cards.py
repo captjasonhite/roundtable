@@ -10,9 +10,13 @@ Same two-source, merge-by-id shape as ``presets.py``:
 A user card with the same ``id`` as a bundled one replaces it; new ids are
 appended. A malformed or unreadable user file is ignored rather than fatal.
 
-``creative-bench.sh`` reads the merged result too (via ``card_for.py``, a thin
-CLI wrapper around ``match()``), so a card edited on the web page changes what
-the next bench run actually uses -- one source of truth, not two.
+``creative-bench.sh`` (its ``card_settings()`` helper) and ``bin/code-stack.sh``
+both read the merged result too, each calling ``match()`` through a short inline
+``python3 -c``, so a card edited on the web page changes what the next bench run
+-- and the next local stack launch -- actually uses. One source of truth, not
+three. code-stack deliberately ignores the card's ``presence`` and treats its
+``temp`` as the default it offers at the prompt: cards are creative profiles,
+and that script runs agentic coding sessions.
 """
 import json
 import os
