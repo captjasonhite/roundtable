@@ -275,6 +275,77 @@ def trash_session(root, name, sp=None):
     return True, "Moved %s to %s/ — still on disk if you want it back." % (name, TRASH)
 
 
+def trash_list(root):
+    """What's in the bin. -> [{name, mtime, runs}] newest first."""
+    trash = os.path.join(os.path.realpath(root), TRASH)
+    out = []
+    try:
+        names = os.listdir(trash)
+    except OSError:
+        return out
+    for name in names:
+        path = os.path.join(trash, name)
+        if not os.path.isdir(path):
+            continue
+        try:
+            files = os.listdir(path)
+        except OSError:
+            files = []
+        out.append({"name": name, "path": path,
+                    "runs": len([f for f in files if session_mod._is_result(f)]),
+                    "mtime": os.path.getmtime(path)})
+    out.sort(key=lambda r: -r["mtime"])
+    return out
+
+
+def empty_trash(root):
+    """Delete the bin's contents for good. -> (count, message).
+
+    The one irreversible action in the app, so it is confined to <root>/.trash
+    by realpath and refuses anything that resolves outside it -- a session
+    directory is user-named, and this is the code path where that matters.
+    """
+    trash = os.path.join(os.path.realpath(root), TRASH)
+    removed = 0
+    for row in trash_list(root):
+        target = os.path.realpath(row["path"])
+        if target != trash and target.startswith(trash + os.sep):
+            shutil.rmtree(target, ignore_errors=True)
+            removed += 1
+    try:
+        os.rmdir(trash)                       # tidy up if it came out empty
+    except OSError:
+        pass
+    return removed, ("Deleted %d session(s) for good." % removed if removed
+                     else "The trash was already empty.")
+
+
+def render_trash(root):
+    """The bin, and the one button in the app that destroys anything."""
+    rows = trash_list(root)
+    body = ["<h1>Trash</h1>"]
+    if not rows:
+        body += ['<div class="card"><p class="note">Nothing in the trash.</p></div>',
+                 '<p class="note"><a href="/">All sessions</a></p>']
+        return _page("Trash — Roundtable", "\n".join(body))
+    body.append('<p class="sub">%d removed session(s), still on disk in %s/</p>'
+                % (len(rows), html.escape(TRASH)))
+    body.append('<div class="card">')
+    for r in rows:
+        body.append('<div class="row"><span>%s</span>'
+                    '<span class="meta">%d runs · %s</span></div>'
+                    % (html.escape(r["name"]), r["runs"],
+                       time.strftime("%Y-%m-%d %H:%M", time.localtime(r["mtime"]))))
+    body.append("</div>")
+    body.append('<div class="card"><p class="note">Emptying the trash deletes '
+                'these for good — there is no second copy. To keep one, move it '
+                'back out of <code>%s/</code> first.</p></div>' % html.escape(TRASH))
+    body.append('<p><form method="post" action="/trash/empty" style="display:inline">'
+                '<button type="submit" class="danger">Empty trash (%d)</button>'
+                '</form> <a href="/" class="quiet">Leave it</a></p>' % len(rows))
+    return _page("Trash — Roundtable", "\n".join(body))
+
+
 def render_delete(root, name, sp=None):
     """The confirmation page. A GET, so nothing is destroyed by following a link."""
     name = _safe_name(name)
@@ -335,10 +406,15 @@ def render_index(root, sp=None, notice=None):
     parts.append('<p class="sub">%s · %d session(s) in %s</p>'
                  % (html.escape(" · ".join(bits)), len(rows), html.escape(root)))
 
+    binned = len(trash_list(root))
     parts.append('<p style="margin:0 0 20px"><a href="/new" style="display:'
                  'inline-block;background:var(--series);color:#fff;font-weight:600;'
                  'font-size:14.5px;text-decoration:none;padding:11px 22px;'
-                 'border-radius:8px">New run</a></p>')
+                 'border-radius:8px">New run</a>%s</p>'
+                 # Only shown when there is something in it: an "Empty trash (0)"
+                 # sitting there permanently is a button that does nothing.
+                 % ('<a href="/trash" class="quiet">Empty trash (%d)</a>' % binned
+                    if binned else ""))
 
     card = _job_card(jobs, notice)
     if card:
@@ -1223,6 +1299,8 @@ def make_handler(root, sp=None):
                 if redirect:
                     return self._send(302, b"", extra={"Location": redirect})
                 return self._send(200, page)
+            if path == "/trash":
+                return self._send(200, render_trash(root))
             if path.startswith("/delete/"):
                 page = render_delete(root, path[len("/delete/"):].strip("/"), sp)
                 if page is None:
@@ -1269,6 +1347,8 @@ def make_handler(root, sp=None):
                 return self._do_cleanup()
             if path == "/delete":
                 return self._do_delete()
+            if path == "/trash/empty":
+                return self._do_empty_trash()
             if path == "/presets/save":
                 return self._do_preset_save()
             if path == "/presets/delete":
@@ -1347,6 +1427,14 @@ def make_handler(root, sp=None):
             ok, message = trash_session(root, (parsed.get("session") or [""])[-1], sp)
             if not ok:
                 return self._error(409 if "right now" in message else 404, message)
+            return self._send(303, b"", extra={
+                "Location": "/?notice=%s" % urllib.parse.quote(message)})
+
+        def _do_empty_trash(self):
+            """Delete the binned sessions for good. No undo past this point."""
+            if self._read_form() is None:
+                return
+            _n, message = empty_trash(root)
             return self._send(303, b"", extra={
                 "Location": "/?notice=%s" % urllib.parse.quote(message)})
 

@@ -384,6 +384,56 @@ class LiveServerTests(unittest.TestCase):
         self.assertIn('<a class="go" href="/new?from=', body)
         self.assertIn('<a class="del" href="/delete/', body)
 
+    # --- the trash --------------------------------------------------------
+
+    def test_trash_count_appears_only_when_something_is_in_it(self):
+        _, body, _ = self.get("/")
+        self.assertNotIn("Empty trash", body)
+        self.session("20260101-000020")
+        self.get("/delete", "POST", "session=20260101-000020")
+        _, body, _ = self.get("/")
+        self.assertIn("Empty trash (1)", body)
+        self.session("20260101-000021")
+        self.get("/delete", "POST", "session=20260101-000021")
+        _, body, _ = self.get("/")
+        self.assertIn("Empty trash (2)", body)
+
+    def test_trash_page_lists_what_would_go(self):
+        self.session("20260101-000022")
+        self.get("/delete", "POST", "session=20260101-000022")
+        status, page, _ = self.get("/trash")
+        self.assertEqual(status, 200)
+        self.assertIn("20260101-000022", page)
+        self.assertIn("Empty trash (1)", page)
+        self.assertTrue(os.path.isdir(
+            os.path.join(self.root, ".trash", "20260101-000022")),
+            "viewing the trash must not empty it")
+
+    def test_emptying_deletes_for_good(self):
+        self.session("20260101-000023")
+        self.get("/delete", "POST", "session=20260101-000023")
+        status, _, headers = self.get("/trash/empty", "POST", "")
+        self.assertEqual(status, 303)
+        self.assertIn("1", urllib.parse.unquote(headers["Location"]))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.root, ".trash", "20260101-000023")))
+        _, body, _ = self.get("/")
+        self.assertNotIn("Empty trash", body)
+
+    def test_emptying_an_empty_trash_is_harmless(self):
+        status, _, headers = self.get("/trash/empty", "POST", "")
+        self.assertEqual(status, 303)
+        self.assertIn("already empty", urllib.parse.unquote(headers["Location"]))
+
+    def test_emptying_never_touches_anything_outside_the_trash(self):
+        keep = self.session("20260101-000024")
+        os.makedirs(os.path.join(self.root, ".trash"), exist_ok=True)
+        # A symlink out of the bin must not take the real session with it.
+        os.symlink(keep, os.path.join(self.root, ".trash", "escape"))
+        self.get("/trash/empty", "POST", "")
+        self.assertTrue(os.path.isdir(keep), "a session outside the trash survived")
+        self.assertTrue(os.path.exists(os.path.join(keep, "01_x_alpha_thinking.md")))
+
     def test_cleanup_clears_every_stuck_job(self):
         self._orphaned_claim("stuck-a")
         self._orphaned_claim("stuck-b")
