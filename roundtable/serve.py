@@ -13,6 +13,7 @@ import json
 import mimetypes
 import os
 import posixpath
+import shutil
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -46,16 +47,21 @@ INDEX_CSS = report.CSS + """
   font-variant-numeric:tabular-nums}
 .row .acts{display:flex;align-items:center;gap:10px;flex:none}
 .row .acts form{margin:0}
-.row .acts button{font-size:12.5px;font-weight:500;padding:5px 11px;
-  border-radius:7px;border:1px solid var(--border);background:none;
-  color:var(--ink2)}
-.row .acts button:hover{border-color:var(--series);color:var(--series);
-  filter:none}
-.row .acts a{font-size:12.5px;font-weight:500;color:var(--ink2);
+/* The two rerun controls are the same action as "New run" at a smaller size,
+   so they carry the same filled accent rather than reading as secondary. */
+.row .acts button,.row .acts a.go{font-size:12.5px;font-weight:600;
+  padding:6px 12px;border-radius:7px;border:1px solid transparent;
+  background:var(--series);color:#fff;text-decoration:none;line-height:1.35}
+.row .acts button:hover,.row .acts a.go:hover{filter:brightness(1.08);
+  text-decoration:none;color:#fff}
+/* Removal stays quiet until you reach for it: it is the one action here that
+   takes something away. */
+.row .acts a.del{font-size:12.5px;font-weight:500;color:var(--muted);
   text-decoration:none;border:1px solid var(--border);border-radius:7px;
   padding:5px 11px}
-.row .acts a:hover{border-color:var(--series);color:var(--series);
+.row .acts a.del:hover{border-color:var(--pos);color:var(--pos);
   text-decoration:none}
+a.quiet{color:var(--ink2);font-size:14px;margin-left:14px}
 @media (max-width:640px){
   .row{flex-wrap:wrap}
   .row .meta{margin-left:auto}
@@ -163,7 +169,9 @@ def list_sessions(root):
         return out
     for name in names:
         path = os.path.join(root, name)
-        if not os.path.isdir(path):
+        # .trash holds removed sessions, which are still complete session
+        # directories -- without this they would list straight back in.
+        if not os.path.isdir(path) or name.startswith("."):
             continue
         try:
             files = os.listdir(path)
@@ -231,6 +239,64 @@ def _job_card(jobs, notice=None):
                html.escape(what), link, html.escape(job["id"]), button))
     parts.append("</div>")
     return "\n".join(parts)
+
+
+TRASH = ".trash"
+
+
+def trash_session(root, name, sp=None):
+    """Move one session out of the listing. -> (ok, message).
+
+    Moved, not deleted. A session is a few hundred kilobytes and cost a
+    quarter-hour of GPU to produce; making the button irreversible to save a
+    megabyte would be a bad trade. It lands in <root>/.trash/, which the
+    listing skips, and can be moved back by hand.
+    """
+    name = _safe_name(name)
+    target = _resolve(root, name) if name else None
+    if target is None or not os.path.isdir(target):
+        return False, "No such session."
+
+    beat = spool.read_heartbeat(sp) or {}
+    live = os.path.basename(str(beat.get("session", "")).rstrip("/"))
+    if beat.get("state") == "running" and live == name:
+        return False, ("That session is being written right now — cancel the "
+                       "job first.")
+
+    trash = os.path.join(os.path.realpath(root), TRASH)
+    os.makedirs(trash, exist_ok=True)
+    dest = os.path.join(trash, name)
+    if os.path.exists(dest):                  # same name binned twice
+        dest = "%s.%s" % (dest, time.strftime("%H%M%S"))
+    try:
+        shutil.move(target, dest)
+    except OSError as exc:
+        return False, "Could not remove it: %s" % exc
+    return True, "Moved %s to %s/ — still on disk if you want it back." % (name, TRASH)
+
+
+def render_delete(root, name, sp=None):
+    """The confirmation page. A GET, so nothing is destroyed by following a link."""
+    name = _safe_name(name)
+    rows = [r for r in list_sessions(root) if r["name"] == name]
+    if not rows:
+        return None
+    r = rows[0]
+    body = [
+        "<h1>Remove this session?</h1>",
+        '<p class="sub">%s</p>' % html.escape(name),
+        '<div class="card"><p class="note">%d run(s), %d judge verdict(s), '
+        'last written %s. It moves to <code>%s/</code> inside the sessions '
+        'directory rather than being deleted, so you can put it back by hand.'
+        '</p></div>'
+        % (r["runs"], r["judges"],
+           time.strftime("%Y-%m-%d %H:%M", time.localtime(r["mtime"])), TRASH),
+        '<p><form method="post" action="/delete" style="display:inline">'
+        '<input type="hidden" name="session" value="%s">'
+        '<button type="submit" class="danger">Remove it</button></form> '
+        '<a href="/" class="quiet">Keep it</a></p>' % html.escape(name),
+    ]
+    return _page("Remove %s — Roundtable" % name, "\n".join(body))
 
 
 def render_index(root, sp=None, notice=None):
@@ -304,10 +370,12 @@ def render_index(root, sp=None, notice=None):
                     '<button type="submit" title="Queue this exact run again — '
                     'same prompts, same models, same settings">Rerun</button>'
                     '</form>'
-                    '<a href="/new?from=%s" title="Open the form with these '
-                    'prompts filled in, so you can change the models and '
-                    'settings before running">Rerun prompts only</a>%s</span>'
-                    % (html.escape(r["name"]), name,
+                    '<a class="go" href="/new?from=%s" title="Open the form with '
+                    'these prompts filled in, so you can change the models and '
+                    'settings before running">Rerun prompts only</a>'
+                    '<a class="del" href="/delete/%s" title="Move this session '
+                    'to the trash folder">Remove</a>%s</span>'
+                    % (html.escape(r["name"]), name, name,
                        # Rewrites the report without the reload tag, so a run
                        # that died stops pretending it is still going.
                        ('<a href="/rebuild/%s" title="Rewrite this report as a '
@@ -1155,6 +1223,11 @@ def make_handler(root, sp=None):
                 if redirect:
                     return self._send(302, b"", extra={"Location": redirect})
                 return self._send(200, page)
+            if path.startswith("/delete/"):
+                page = render_delete(root, path[len("/delete/"):].strip("/"), sp)
+                if page is None:
+                    return self._error(404, "No such session.")
+                return self._send(200, page)
             if path.startswith("/rebuild/"):
                 name = path[len("/rebuild/"):].strip("/")
                 if not rebuild_session(root, name, sp):
@@ -1194,6 +1267,8 @@ def make_handler(root, sp=None):
                 return self._do_cancel()
             if path == "/cleanup":
                 return self._do_cleanup()
+            if path == "/delete":
+                return self._do_delete()
             if path == "/presets/save":
                 return self._do_preset_save()
             if path == "/presets/delete":
@@ -1261,6 +1336,17 @@ def make_handler(root, sp=None):
             if back == "job":
                 return self._send(303, b"", extra={
                     "Location": "/job/%s" % urllib.parse.quote(job_id)})
+            return self._send(303, b"", extra={
+                "Location": "/?notice=%s" % urllib.parse.quote(message)})
+
+        def _do_delete(self):
+            """Move a session to the trash folder. POST, so no link can do it."""
+            parsed = self._read_form()
+            if parsed is None:
+                return
+            ok, message = trash_session(root, (parsed.get("session") or [""])[-1], sp)
+            if not ok:
+                return self._error(409 if "right now" in message else 404, message)
             return self._send(303, b"", extra={
                 "Location": "/?notice=%s" % urllib.parse.quote(message)})
 

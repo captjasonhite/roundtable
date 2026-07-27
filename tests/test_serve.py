@@ -332,6 +332,58 @@ class LiveServerTests(unittest.TestCase):
         self.assertEqual(self.get("/cancel", "POST", "job=old")[0], 409)
         self.assertEqual(self.get("/cancel", "POST", "job=ghost")[0], 409)
 
+    # --- removing a session ---------------------------------------------
+
+    def test_remove_moves_the_session_to_trash(self):
+        """Moved, not deleted: a session costs a quarter-hour of GPU."""
+        self.session("20260101-000009")
+        status, page, _ = self.get("/delete/20260101-000009")
+        self.assertEqual(status, 200)
+        self.assertIn("Remove this session?", page)
+        self.assertTrue(os.path.isdir(os.path.join(self.root, "20260101-000009")),
+                        "the confirm page must not remove anything")
+
+        status, _, headers = self.get("/delete", "POST",
+                                      "session=20260101-000009")
+        self.assertEqual(status, 303)
+        self.assertFalse(os.path.isdir(os.path.join(self.root, "20260101-000009")))
+        self.assertTrue(os.path.isdir(
+            os.path.join(self.root, ".trash", "20260101-000009")))
+
+    def test_a_removed_session_leaves_the_listing(self):
+        self.session("20260101-000010")
+        self.get("/delete", "POST", "session=20260101-000010")
+        status, body, _ = self.get("/")
+        self.assertNotIn("20260101-000010", body)
+        self.assertNotIn(".trash", body)
+
+    def test_a_session_being_written_right_now_is_refused(self):
+        path = self.session("20260101-000011")
+        spool.heartbeat(self.spool, state="running", job="j", session=path)
+        status, _, _ = self.get("/delete", "POST", "session=20260101-000011")
+        self.assertEqual(status, 409)
+        self.assertTrue(os.path.isdir(path))
+
+    def test_remove_cannot_escape_the_sessions_root(self):
+        for attempt in ("../../etc", "/etc", ".ssh", "..%2f..%2fetc"):
+            status, _, _ = self.get("/delete", "POST",
+                                    "session=%s" % urllib.parse.quote(attempt))
+            self.assertIn(status, (404, 409), attempt)
+
+    def test_removing_the_same_name_twice_keeps_both(self):
+        self.session("20260101-000012")
+        self.get("/delete", "POST", "session=20260101-000012")
+        self.session("20260101-000012")
+        self.get("/delete", "POST", "session=20260101-000012")
+        binned = os.listdir(os.path.join(self.root, ".trash"))
+        self.assertEqual(len([b for b in binned if b.startswith("20260101-000012")]), 2)
+
+    def test_rerun_controls_carry_the_primary_style(self):
+        self.session("20260101-000013")
+        _, body, _ = self.get("/")
+        self.assertIn('<a class="go" href="/new?from=', body)
+        self.assertIn('<a class="del" href="/delete/', body)
+
     def test_cleanup_clears_every_stuck_job(self):
         self._orphaned_claim("stuck-a")
         self._orphaned_claim("stuck-b")
