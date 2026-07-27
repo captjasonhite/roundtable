@@ -21,9 +21,13 @@
 #                     fall back to --mode/MODE.
 #   --mode MODE       thinking (default) | nothinking | both — default mode for
 #                     any --models pattern that doesn't specify its own.
-#                     No-thinking is no longer offered in the interactive menu:
-#                     it lost to thinking on every judge in the first real
-#                     session. Still selectable here, or with MODE= in the env.
+#                     No-thinking is not offered in the interactive menu, on the
+#                     strength of a session that turned out not to be blind; the
+#                     blind evidence says the better mode is per-model. See the
+#                     note above DEFAULT_MODE_KEY before repeating either claim.
+#                     Still selectable here, or with MODE= in the env.
+#                     Cydonia is a no-op: Mistral-based, no reasoning mode, and
+#                     the two settings return byte-identical text. Don't retest.
 #   --yes             don't ask for confirmation before running the queue
 #   --no-card-settings  ignore the per-model HuggingFace card sampler settings and
 #                     run every model on one identical profile (controlled compare)
@@ -358,12 +362,31 @@ enqueue() {  # enqueue <model> <t|n|b>
   esac
 }
 
-# Thinking is the only advertised mode as of 2026-07-23: across the first real
-# 9-run session, four of five judge models ranked every thinking output above
-# every no-thinking one (planning the restructure is most of the job on
-# editorial prompts). MODE=nothinking / --mode nothinking still work as an
-# escape hatch — worth re-testing on pure prose-generation prompts, where the
-# planning step may matter less.
+# Thinking is the only advertised mode, but NOT because thinking always wins.
+#
+# The original reason said four of five judges ranked every thinking output
+# above every no-thinking one, in the 9-run session 20260723-174614. That
+# session was NOT blind: its judges read headings saying "(thinking)" and
+# "(no thinking)" and graded the label. Proven the same evening — blind
+# judging of Cydonia's two modes, which produce byte-identical text, had
+# previously placed them eight ranks apart when the label was visible.
+#
+# The blind rerun (20260723-211143, 10 entries, 5 judges) says mode is
+# PER-MODEL, not universal:
+#
+#     A3B          thinking  #1 (0.92)  vs no-thinking #5 (0.53)   thinking
+#     heretic-v2   thinking  #2 (0.86)  vs no-thinking #8 (0.36)   thinking
+#     Fable-Fus    thinking  #4 (0.61)  vs no-thinking #3 (0.69)   no-thinking
+#     Gemma4       thinking  #6 (0.47)  vs no-thinking #7 (0.47)   tie
+#     Cydonia      thinking #10 (0.06)  vs no-thinking #9 (0.11)   no-op
+#
+# which is what the per-model defaults in the Roundtable form already encode.
+# One blind session, five of whose verdicts needed regex salvage, at the entry
+# count with the widest position spread on record: real evidence, thin.
+#
+# So the menu hiding no-thinking rests on the unusable session, not this one.
+# MODE=nothinking / --mode nothinking remain the escape hatch. Fable-Fus is the
+# one genuinely open case and deserves a paired test of its own.
 DEFAULT_MODE_KEY=t
 case "${MODE:-thinking}" in
   nothinking) DEFAULT_MODE_KEY=n ;;
