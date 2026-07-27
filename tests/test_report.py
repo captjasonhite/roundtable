@@ -215,7 +215,7 @@ class ReportRenderTests(unittest.TestCase):
         """An older session has no expected-* files; it reads 1/1, not 1/0."""
         self.write("01_x_alpha_thinking.md", RUN)
         data, html = self.render()
-        self.assertEqual(report._counts(data), (1, 1, 0, 0))
+        self.assertEqual(report._counts(data), (1, 1, 0, 0, 0, 0))
         self.assertIn(">1/1<", html)
 
     def test_total_never_below_what_exists(self):
@@ -236,12 +236,15 @@ class ReportRenderTests(unittest.TestCase):
         now = 1_800_000_000.0
         data["started"], data["touched"] = now - 600, now - 60
         bar = report._progress(data, now=now)
-        self.assertEqual(bar.count('class="c '), 6)
-        self.assertEqual(bar.count("c done"), 1)
+        track = bar.split('<div class="foot">')[0]
+        self.assertEqual(track.count('class="c '), 6)
+        self.assertEqual(track.count("c run"), 1)   # legend swatches excluded
         self.assertEqual(bar.count("c pend"), 5)
-        self.assertIn("<b>1 of 6</b>", bar)
-        self.assertIn("5 to go", bar)
+        self.assertIn("<b>1/4</b> generating", bar)
+        self.assertIn("<b>0/2</b> judging", bar)
         self.assertIn("50 min", bar)
+        self.assertFalse(bar.split('<div class="foot">')[0].endswith(
+            '<i class="gap"></i></div>'), "no trailing separator")
 
     def test_no_eta_for_a_session_nobody_is_writing_to(self):
         """A queue that died leaves its counts short forever -- an ETA computed
@@ -261,7 +264,7 @@ class ReportRenderTests(unittest.TestCase):
         now = 1_800_000_000.0
         data["started"], data["touched"] = now - 3600, now - 60
         bar = report._progress(data, now=now)
-        self.assertIn("<b>1 of 1</b>", bar)
+        self.assertIn("<b>1/1</b> generating", bar)
         self.assertIn("took 59 min", bar)
         self.assertNotIn("ETA", bar)
 
@@ -280,9 +283,12 @@ class ReportRenderTests(unittest.TestCase):
         self.write(".expected-judges", "1\n")
         self.write(".expected-meta", "1\n")
         data = session_mod.load(self.dir)
-        self.assertEqual(report._counts(data), (1, 1, 1, 2))
+        # The synthesis is counted apart from the judges now: 1/1 judging,
+        # 0/1 summary, rather than one 1/2 that hid a second model load.
+        self.assertEqual(report._counts(data), (1, 1, 1, 1, 0, 1))
         bar = report._progress(data, now=1_800_000_000.0)
-        self.assertIn("<b>2 of 3</b>", bar)
+        self.assertIn("<b>1/1</b> judging", bar)
+        self.assertIn("<b>0/1</b> summary", bar)
         self.assertIn("synthesis (round 3) — not run yet", bar)
 
     def test_round3_present_counts_as_done(self):
@@ -290,11 +296,52 @@ class ReportRenderTests(unittest.TestCase):
         self.write("summary_20260101-000000_alpha-7B.md", VERDICT)
         self.write("round3_20260101-000000_alpha-7B.md", RUN)
         data = session_mod.load(self.dir)
-        self.assertEqual(report._counts(data), (1, 1, 2, 2))
+        self.assertEqual(report._counts(data), (1, 1, 1, 1, 1, 1))
         bar = report._progress(data, now=1_800_000_000.0)
-        self.assertIn("<b>3 of 3</b>", bar)
+        self.assertIn("<b>1/1</b> summary", bar)
         self.assertNotIn("not run yet", bar)
 
+    def test_each_phase_gets_its_own_colour(self):
+        """A stalled bar should say which stage it stalled in."""
+        self.write("01_x_alpha_thinking.md", RUN)
+        self.write("summary_20260101-000000_alpha-7B.md", VERDICT)
+        self.write("round3_20260101-000000_alpha-7B.md", RUN)
+        bar = report._progress(session_mod.load(self.dir), now=1_800_000_000.0)
+        for cls in ("c run", "c judge", "c meta"):
+            self.assertIn(cls, bar)
+        for word in ("generating", "judging", "summary"):
+            self.assertIn(word, bar)
+
+
+
+class TruncationTests(unittest.TestCase):
+    """An entry cut off by MAX_TOKENS must not read as a bad entry."""
+
+    def session(self, truncated):
+        return {
+            "name": "s", "dir": "/tmp/s", "blind": True, "key": {},
+            "runs": [{"model": "alpha-7B", "mode": "thinking", "tokens": 8192.0,
+                      "truncated": truncated, "error": None, "label": "A",
+                      "body": "## Output\n\ncut off mid-sen", "elapsed": 1.0,
+                      "tps": 1.0, "image": "", "context": "", "temperature": "1.0",
+                      "seed": "1", "samplers": "", "sampler_profile": "x",
+                      "file": "01.md"}],
+            "judges": [], "meta_summary": None, "images": [],
+            "temperature": "1.0", "seed": "1", "samplers": "",
+            "system_prompt": "", "user_prompt": "", "expected_runs": 1.0,
+            "expected_judges": 0.0, "expected_meta": 0.0,
+            "started": 0.0, "touched": 1.0,
+        }
+
+    def test_a_truncated_run_is_called_out(self):
+        html = report._truncation_warning(self.session(True), {"standings": []})
+        self.assertIn("token limit", html)
+        self.assertIn("alpha-7B", html)
+        self.assertIn("budget result", html)
+
+    def test_nothing_is_said_when_nothing_was_cut(self):
+        self.assertEqual(
+            report._truncation_warning(self.session(False), {"standings": []}), "")
 
 if __name__ == "__main__":
     unittest.main()

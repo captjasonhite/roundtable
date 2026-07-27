@@ -129,6 +129,16 @@ def read_runs(sdir, key):
             "samplers": meta.get("samplers", ""),
             "sampler_profile": meta.get("sampler_profile", ""),
             "error": None if err in (None, "null", "") else err,
+            # Ran out of MAX_TOKENS mid-sentence. Not an error -- the file is
+            # complete and the text is real -- but the deliverable is not, and
+            # judges grade it as though the model simply wrote badly. Older
+            # sessions predate the field; fall back to the tell-tale sign, a
+            # token count sitting exactly on a power-of-two cap.
+            "truncated": (meta.get("truncated") == "true"
+                          if "truncated" in meta else
+                          bool(_num(meta.get("tokens"))
+                               and _num(meta.get("tokens")) >= 4096
+                               and _num(meta.get("tokens")) % 1024 == 0)),
             "body": body,
         })
     return runs

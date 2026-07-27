@@ -113,7 +113,12 @@ DRY_MULTIPLIER="${DRY_MULTIPLIER:-0}"   # OFF — see the note above. Set 0.8 to
 DRY_BASE="${DRY_BASE:-1.75}"
 DRY_ALLOWED_LENGTH="${DRY_ALLOWED_LENGTH:-2}"
 DRY_PENALTY_LAST_N="${DRY_PENALTY_LAST_N:--1}"
-MAX_TOKENS="${MAX_TOKENS:-8192}"
+MAX_TOKENS="${MAX_TOKENS:-16384}"  # 16384, matching SUMMARY_MAX_TOKENS below and
+                                   # for the same reason: this budget is shared between the
+                                   # reasoning trace and the answer, so a thinking model can
+                                   # spend it before it starts writing. At 8192, session
+                                   # 20260727-101456 cut Ornith and heretic-v2 off mid-sentence
+                                   # and the panel scored them last and second-last for it.
 
 # --- server settings (same proven values as code-stack.sh) ------------------
 CTX="${CTX:-auto}"
@@ -540,17 +545,25 @@ req = urllib.request.Request(
 )
 
 t0 = time.time()
-err = None; content = ""; reasoning = ""; ntok = 0
+err = None; content = ""; reasoning = ""; ntok = 0; finish = ""
 try:
     with urllib.request.urlopen(req, timeout=float(E["REQUEST_TIMEOUT"])) as r:
         data = json.load(r)
-    msg = data["choices"][0]["message"]
+    choice = data["choices"][0]
+    msg = choice["message"]
     content = msg.get("content") or ""
     reasoning = msg.get("reasoning_content") or ""
     ntok = (data.get("usage") or {}).get("completion_tokens", 0) or 0
+    # "length" means the model was still writing when MAX_TOKENS ran out. A
+    # truncated run is not a worse model, it is an unfinished deliverable --
+    # and judges mark it down as if it were the former. Recorded so the report
+    # can say so instead of leaving a half-sentence to speak for itself.
+    finish = choice.get("finish_reason") or ""
 except urllib.error.HTTPError as e:
+    finish = ""
     err = "HTTP %s: %s" % (e.code, e.read().decode("utf-8", "replace")[:2000])
 except Exception as e:
+    finish = ""
     err = "%s: %s" % (type(e).__name__, e)
 elapsed = time.time() - t0
 tps = round(ntok / elapsed, 2) if elapsed > 0 and ntok else 0
@@ -638,6 +651,8 @@ with open(E["OUT_FILE"], "w") as f:
     f.write("tokens: %d\n"       % ntok)
     f.write("tokens_per_sec: %s\n" % tps)
     f.write("elapsed_sec: %d\n"  % round(elapsed))
+    f.write("finish_reason: %s\n" % esc(finish or "unknown"))
+    f.write("truncated: %s\n"   % ("true" if finish == "length" else "false"))
     f.write("error: %s\n"        % (esc(err) if err else "null"))
     if retried:
         f.write("ranking_retry: true\n")

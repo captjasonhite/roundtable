@@ -124,8 +124,15 @@ code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.
   padding:14px 16px;margin:0 0 18px}
 .prog .track{display:flex;gap:2px;align-items:stretch;height:16px}
 .prog .c{flex:1;min-width:3px;border-radius:3px;display:block}
-.prog .c.done{background:var(--series)}
+/* One colour per phase, walking down the sequential ramp: generating is most
+   of the wall clock, judging follows it, the synthesis is the last step. */
+.prog .c.run{background:var(--b4)}
+.prog .c.judge{background:var(--b2)}
+.prog .c.meta{background:var(--b0)}
 .prog .c.fail{background:var(--pos)}
+.prog .key{display:flex;gap:14px;margin-top:8px;font-size:12px;color:var(--muted)}
+.prog .key span{display:flex;align-items:center;gap:5px}
+.prog .key i{width:11px;height:11px;border-radius:3px;display:inline-block}
 .prog .c.pend{background:var(--zero);border:1px solid var(--border)}
 .prog .gap{flex:none;width:10px}
 .prog .foot{display:flex;justify-content:space-between;gap:12px;margin-top:7px;
@@ -186,7 +193,7 @@ def _has_meta(session):
 
 
 def _counts(session):
-    """-> (runs_done, runs_total, judges_done, judges_total).
+    """-> (runs_done, runs_total, judges_done, judges_total, meta_done, meta_total).
 
     Totals come from the counts creative-bench.sh drops in the session dir; they
     fall back to what's on disk, so an old session (or one whose runner never
@@ -208,9 +215,11 @@ def _counts(session):
     meta_done = 1 if session.get("meta_summary") else 0
     expected_meta = session.get("expected_meta")
     meta_total = meta_done if expected_meta is None else int(expected_meta)
-    judges_done += meta_done
-    judges_total += max(meta_done, meta_total)
-    return runs_done, runs_total, judges_done, judges_total
+    meta_total = max(meta_done, meta_total)
+    # Reported apart from the judges. It IS a judge run -- it loads a model and
+    # generates -- but folding it in made "0/6" read as "0 of 6 judges" when it
+    # meant "0 of 5 judges and a synthesis", and the two are different waits.
+    return runs_done, runs_total, judges_done, judges_total, meta_done, meta_total
 
 
 def fmt_dur(seconds):
@@ -253,30 +262,27 @@ def _progress(session, now=None):
     an ETA simply stops being offered once there's nothing left to wait for.
     """
     now = now or time.time()
-    runs_done, runs_total, judges_done, judges_total = _counts(session)
-    total = runs_total + judges_total
-    done = runs_done + judges_done
+    (runs_done, runs_total, judges_done, judges_total,
+     meta_done, meta_total) = _counts(session)
+    total = runs_total + judges_total + meta_total
+    done = runs_done + judges_done + meta_done
     if not total:
         return ""
 
-    # Round 3 is the last judge run, so it belongs at the end of the judge group
-    # rather than in a group of its own.
-    judge_items = list(session["judges"])
-    if session.get("meta_summary"):
-        judge_items.append(session["meta_summary"])
-
+    meta_items = [session["meta_summary"]] if session.get("meta_summary") else []
     failed = sum(1 for r in session["runs"] if r["error"])
-    failed += sum(1 for j in judge_items if j["error"])
+    failed += sum(1 for j in list(session["judges"]) + meta_items if j["error"])
 
     cells = []
+    # One colour per phase: writing, judging, and the synthesis that reads the
+    # judges. Without it a stalled bar gives no clue which stage stalled in.
     for group, items, group_total, noun in (
             ("run", session["runs"], runs_total, "output run"),
-            ("judge", judge_items, judges_total, "judge run")):
+            ("judge", session["judges"], judges_total, "judge run"),
+            ("meta", meta_items, meta_total, "synthesis (round 3)")):
         for i in range(group_total):
             item = items[i] if i < len(items) else None
-            last = (group == "judge" and i == group_total - 1)
-            what = "synthesis (round 3)" if last and _has_meta(session) else \
-                   "%s %d" % (noun, i + 1)
+            what = noun if group == "meta" else "%s %d" % (noun, i + 1)
             if item is None:
                 cells.append('<i class="c pend" title="%s — not run yet"></i>'
                              % esc(what))
@@ -287,18 +293,25 @@ def _progress(session, now=None):
                 label += " (%s)" % item["mode"]
             if item.get("elapsed"):
                 label += " · %s" % fmt_dur(item["elapsed"])
-            cls = "c fail" if item["error"] else "c done"
+            cls = "c fail" if item["error"] else "c %s" % group
             if item["error"]:
                 label += " · failed"
             cells.append('<i class="%s" title="%s"></i>' % (cls, esc(label)))
-        if group == "run" and judges_total:
+        # A separator only when another phase actually follows, or the bar
+        # ends on a gap that looks like a missing cell.
+        if ((group == "run" and (judges_total or meta_total))
+                or (group == "judge" and meta_total)):
             cells.append('<i class="gap"></i>')
 
-    left = ["<b>%d of %d</b> runs complete" % (done, total)]   # counts, nothing to escape
+    # Counted per phase, because they are different waits: generating is most of
+    # the wall clock, judging follows it, and the synthesis is one last model.
+    left = ["<b>%d/%d</b> generating" % (runs_done, runs_total)]
+    if judges_total:
+        left.append("<b>%d/%d</b> judging" % (judges_done, judges_total))
+    if meta_total:
+        left.append("<b>%d/%d</b> summary" % (meta_done, meta_total))
     if failed:
         left.append("%d failed" % failed)
-    if done < total:
-        left.append("%d to go" % (total - done))
 
     right = ""
     eta = _eta(session, done, total, now)
@@ -314,9 +327,17 @@ def _progress(session, now=None):
         right = ("stopped &mdash; nothing written for %s"
                  % fmt_dur(now - session["touched"]))
 
+    key = ['<span><i class="c run"></i>generating</span>']
+    if judges_total:
+        key.append('<span><i class="c judge"></i>judging</span>')
+    if meta_total:
+        key.append('<span><i class="c meta"></i>summary</span>')
+    if failed:
+        key.append('<span><i class="c fail"></i>failed</span>')
     return ('<div class="prog"><div class="track">%s</div>'
-            '<div class="foot"><span>%s</span><span class="eta">%s</span></div></div>'
-            % ("".join(cells), " · ".join(left), right))
+            '<div class="foot"><span>%s</span><span class="eta">%s</span></div>'
+            '<div class="key">%s</div></div>'
+            % ("".join(cells), " · ".join(left), right, "".join(key)))
 
 
 def _tiles(session, result, rankings):
@@ -329,15 +350,23 @@ def _tiles(session, result, rankings):
     if top:
         tiles.append(("Panel pick", short_model(top["model"], 30),
                       "%s · score %s" % (top["mode"], C.fmt(top["score"]))))
-    runs_done, runs_total, judges_done, judges_total = _counts(session)
+    (runs_done, runs_total, judges_done, judges_total,
+     meta_done, meta_total) = _counts(session)
     run_hint = "all completed" if runs_done >= runs_total else "%d to go" % (runs_total - runs_done)
     if len(ok) != len(runs):
         run_hint = "%d failed" % (len(runs) - len(ok))
     tiles.append(("Output runs", "%d/%d" % (runs_done, runs_total), run_hint))
-    tiles.append(("Judge runs", "%d/%d" % (judges_done, judges_total),
+    # "0/6 + 0/1": the panel and the synthesis are separate waits, and a single
+    # 0/7 hid the fact that a seventh model load was still to come.
+    judge_value = "%d/%d" % (judges_done, judges_total)
+    if meta_total:
+        judge_value += " + %d/%d" % (meta_done, meta_total)
+    left = (judges_total - judges_done) + (meta_total - meta_done)
+    tiles.append(("Judge runs", judge_value,
                   "%d ranked every output" % result["agreement_n"]
-                  if judges_done >= judges_total and judges_total
-                  else "%d to go" % (judges_total - judges_done)))
+                  if not left and judges_total
+                  else "%d to go%s" % (left, ", incl. summary" if
+                                       meta_total > meta_done else "")))
     if result["agreement"] is not None:
         tiles.append(("Agreement", C.fmt(result["agreement"]),
                       C.agreement_label(result["agreement"])))
@@ -386,12 +415,36 @@ def _too_close(result):
             'caveat below the table.</p>' % body)
 
 
-def _standings(result):
+def _truncation_warning(session, result):
+    """Name any entry that ran out of tokens before it finished.
+
+    Without this the standings punish an unfinished deliverable exactly as if
+    the model had written badly, and nothing on the page says which it was. It
+    cost a session: two entries hit the cap mid-sentence and finished last and
+    second-last, which read as a quality collapse until the token counts were
+    checked by hand.
+    """
+    cut = [r for r in session["runs"] if r.get("truncated")]
+    if not cut:
+        return ""
+    names = ", ".join("%s (%s)" % (esc(short_model(r["model"], 26)), esc(r["mode"]))
+                      for r in cut)
+    return ('<p class="note warn"><b>%d entr%s stopped at the token limit '
+            'mid-sentence</b> — %s. Judges grade an unfinished draft as a bad '
+            'one, so treat %s placing below the rest as a budget result, not a '
+            'quality result. Raise MAX_TOKENS and run again to compare them '
+            'fairly.</p>'
+            % (len(cut), "y" if len(cut) == 1 else "ies", names,
+               "its" if len(cut) == 1 else "their"))
+
+
+def _standings(result, session=None):
     rows = [r for r in result["standings"] if r["score"] is not None]
     if not rows:
         return ""
     out = ['<p class="eyebrow">Round 2 &middot; blind judging</p>',
            '<h2>Panel standings</h2>',
+           _truncation_warning(session, result) if session else "",
            '<p class="note">Mean percentile across judges, self-votes removed '
            '(1.00 = best of the field, 0.00 = worst). Bars share one scale.</p>',
            _too_close(result),
@@ -840,7 +893,7 @@ def render(session, result, rankings, running=False, refresh=15,
     body.append(_progress(session))
     body.append(_meta_summary(session, result))
     body.append(_outputs_section(session, result))
-    body.append(_standings(result))
+    body.append(_standings(result, session))
     body.append(_verdicts_section(session, result, rankings))
     body.append(_heatmap(session, result, rankings))
     body.append(_selfbias(result))

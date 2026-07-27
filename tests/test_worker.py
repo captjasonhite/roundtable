@@ -275,8 +275,8 @@ class WorkerLoopTests(unittest.TestCase):
         with open(os.path.join(self.spool, "done", "r3-count.json")) as f:
             sdir = json.load(f)["session_dir"]
         self.assertEqual(session_mod.load(sdir)["expected_meta"], 1)
-        _, _, judges_done, judges_total = report._counts(session_mod.load(sdir))
-        self.assertEqual(judges_done, judges_total)      # it did run, so it's done
+        counts = report._counts(session_mod.load(sdir))
+        self.assertEqual(counts[4], counts[5])           # it did run, so it's done
 
     def test_a_skipped_round_3_is_taken_back_off_the_count(self):
         """Opted out: the report must not sit one run short of complete."""
@@ -288,8 +288,8 @@ class WorkerLoopTests(unittest.TestCase):
             sdir = json.load(f)["session_dir"]
         data = session_mod.load(sdir)
         self.assertEqual(data["expected_meta"], 0)
-        _, _, judges_done, judges_total = report._counts(data)
-        self.assertEqual(judges_done, judges_total)
+        counts = report._counts(data)
+        self.assertEqual(counts[4], counts[5])
 
     def test_round_3_is_skipped_when_not_requested(self):
         os.environ["STUB_DELAY"] = "0"

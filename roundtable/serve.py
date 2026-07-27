@@ -722,7 +722,7 @@ def render_form(error=None, values=None, models_root=None, presets=None, notice=
     body.append('<div class="grid">')
     body.append('<div class="field"><label for="max_tokens">Max tokens</label>'
                 '<input type="number" id="max_tokens" name="max_tokens" min="64" '
-                'step="64" value="%s"></div>' % val("max_tokens", "8192"))
+                'step="64" value="%s"></div>' % val("max_tokens", "16384"))
     body.append('<div class="field"><label for="seed">Seed</label>'
                 '<input type="text" id="seed" name="seed" value="%s" '
                 'placeholder="random"><p class="hint">Shared by every run.</p>'
