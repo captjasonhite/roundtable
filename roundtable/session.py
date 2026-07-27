@@ -128,6 +128,10 @@ def read_runs(sdir, key):
             "seed": meta.get("seed", ""),
             "samplers": meta.get("samplers", ""),
             "sampler_profile": meta.get("sampler_profile", ""),
+            # Speculative decoding, recorded since 2026-07-27. Absent in older
+            # files, where the depth was whatever the default was at the time.
+            "mtp": meta.get("mtp") == "true" if "mtp" in meta else None,
+            "spec_draft_n_max": _num(meta.get("spec_draft_n_max")),
             "error": None if err in (None, "null", "") else err,
             # Ran out of MAX_TOKENS mid-sentence. Not an error -- the file is
             # complete and the text is real -- but the deliverable is not, and

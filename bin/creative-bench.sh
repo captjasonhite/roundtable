@@ -50,12 +50,16 @@
 #   DRY_MULTIPLIER DRY_BASE DRY_ALLOWED_LENGTH DRY_PENALTY_LAST_N
 #   MAX_TOKENS=8192       cap on tokens generated per run
 #   SEED=<n>              pin the shared seed instead of picking one at random
+#   SPEC_DRAFT_N_MAX=2    MTP draft depth, when the GGUF carries nextn layers.
+#                         Recorded in each result file, so a session run at a
+#                         different depth is identifiable afterwards.
 #   CTX=<n>               pin context instead of --fit auto-sizing
 #   FIT_TARGET FIT_MIN_CTX N_GPU_LAYERS CACHE_TYPE_K CACHE_TYPE_V
 #   REASONING_BUDGET=-1   thinking-token cap for thinking runs (-1 = unlimited)
 #   SUMMARY_MODE=thinking      thinking|nothinking for the summary pass
 #   SUMMARY_TEMP=0.7           temperature for the summary pass
-#   SUMMARY_MAX_TOKENS=<n>     token cap for each summary (defaults to MAX_TOKENS)
+#   SUMMARY_MAX_TOKENS=<n>     token cap for each summary (default 16384, set
+#                              independently of MAX_TOKENS -- it does NOT follow it)
 #   CHAT_TEMPLATE_FILE    'auto' (default) = the GGUF's embedded template; set a
 #                         path to force one. Unlike code-stack.sh this does NOT
 #                         swap in the tool-calling template — that one is tuned
@@ -643,6 +647,13 @@ with open(E["OUT_FILE"], "w") as f:
     f.write("thinking: %s\n"     % ("true" if E["MODE"] == "thinking" else "false"))
     f.write("temperature: %s\n"  % E["TEMP"])
     f.write("sampler_profile: %s\n" % esc(E.get("SAMPLER_PROFILE", "?")))
+    # Speculative decoding settings belong in the record for the same reason the
+    # samplers do: changing the draft depth changes throughput and the sampling
+    # path, and a session run at a different depth is otherwise indistinguishable
+    # from one run at the default.
+    f.write("mtp: %s\n" % ("true" if E.get("RUN_MTP") == "1" else "false"))
+    if E.get("RUN_MTP") == "1":
+        f.write("spec_draft_n_max: %s\n" % E.get("RUN_SPEC_DRAFT_N_MAX", "2"))
     f.write("samplers: %s\n" % esc("top_p %s, top_k %s, min_p %s, repeat %s, presence %s, dry %s" % (
         E.get("TOP_P"), E.get("TOP_K"), E.get("MIN_P"),
         E.get("REPEAT_PENALTY"), E.get("PRESENCE_PENALTY"), E.get("DRY_MULTIPLIER"))))
@@ -851,6 +862,7 @@ do_run() {
     DRY_PENALTY_LAST_N="$DRY_PENALTY_LAST_N" \
     ACTUAL_CTX="${ACTUAL_CTX:-}" REQUEST_TIMEOUT="$REQUEST_TIMEOUT" \
     REQUIRE_LABELS="${REQUIRE_LABELS:-}" \
+    RUN_MTP="$HAS_MTP" RUN_SPEC_DRAFT_N_MAX="${SPEC_DRAFT_N_MAX:-2}" \
     python3 "$HELPER" 2>&1
   )"
   RC=$?
