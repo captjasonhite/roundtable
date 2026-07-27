@@ -335,14 +335,8 @@ class LiveServerTests(unittest.TestCase):
     # --- removing a session ---------------------------------------------
 
     def test_remove_moves_the_session_to_trash(self):
-        """Moved, not deleted: a session costs a quarter-hour of GPU."""
+        """One click, and moved rather than deleted: the trash is the undo."""
         self.session("20260101-000009")
-        status, page, _ = self.get("/delete/20260101-000009")
-        self.assertEqual(status, 200)
-        self.assertIn("Remove this session?", page)
-        self.assertTrue(os.path.isdir(os.path.join(self.root, "20260101-000009")),
-                        "the confirm page must not remove anything")
-
         status, _, headers = self.get("/delete", "POST",
                                       "session=20260101-000009")
         self.assertEqual(status, 303)
@@ -355,7 +349,9 @@ class LiveServerTests(unittest.TestCase):
         self.get("/delete", "POST", "session=20260101-000010")
         status, body, _ = self.get("/")
         self.assertNotIn("20260101-000010", body)
-        self.assertNotIn(".trash", body)
+        # The bin is a directory of complete sessions; it must not list as one.
+        rows = [line for line in body.splitlines() if '<div class="row">' in line]
+        self.assertFalse([r for r in rows if ".trash" in r], rows)
 
     def test_a_session_being_written_right_now_is_refused(self):
         path = self.session("20260101-000011")
@@ -382,7 +378,16 @@ class LiveServerTests(unittest.TestCase):
         self.session("20260101-000013")
         _, body, _ = self.get("/")
         self.assertIn('<a class="go" href="/new?from=', body)
-        self.assertIn('<a class="del" href="/delete/', body)
+        self.assertIn('<button type="submit" class="del"', body)
+
+    def test_remove_is_a_post_not_a_link(self):
+        """A prefetcher following links must not be able to bin a session."""
+        self.session("20260101-000014")
+        _, body, _ = self.get("/")
+        self.assertNotIn('href="/delete', body)
+        self.assertIn('action="/delete"', body)
+        self.assertEqual(self.get("/delete/20260101-000014")[0], 404)
+        self.assertTrue(os.path.isdir(os.path.join(self.root, "20260101-000014")))
 
     # --- the trash --------------------------------------------------------
 

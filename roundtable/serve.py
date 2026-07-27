@@ -54,14 +54,19 @@ INDEX_CSS = report.CSS + """
   background:var(--series);color:#fff;text-decoration:none;line-height:1.35}
 .row .acts button:hover,.row .acts a.go:hover{filter:brightness(1.08);
   text-decoration:none;color:#fff}
-/* Removal stays quiet until you reach for it: it is the one action here that
-   takes something away. */
-.row .acts a.del{font-size:12.5px;font-weight:500;color:var(--muted);
-  text-decoration:none;border:1px solid var(--border);border-radius:7px;
-  padding:5px 11px}
-.row .acts a.del:hover{border-color:var(--pos);color:var(--pos);
-  text-decoration:none}
+/* Removal carries the same weight as the rerun controls, in red: it acts on
+   the first click, so it should not look like something that opens a page. */
+.row .acts button.del{font-size:12.5px;font-weight:600;padding:6px 12px;
+  border-radius:7px;border:1px solid transparent;background:var(--pos);
+  color:#fff;line-height:1.35}
+.row .acts button.del:hover{filter:brightness(1.08);color:#fff}
 a.quiet{color:var(--ink2);font-size:14px;margin-left:14px}
+/* The trash button, on the index and on the trash page itself. */
+.trash{display:inline-block;background:var(--pos);color:#fff;font-weight:600;
+  font-size:14.5px;text-decoration:none;padding:11px 22px;border-radius:8px;
+  border:1px solid transparent;margin-left:12px;line-height:1.35;
+  font-family:inherit}
+.trash:hover{filter:brightness(1.08);color:#fff;text-decoration:none}
 @media (max-width:640px){
   .row{flex-wrap:wrap}
   .row .meta{margin-left:auto}
@@ -73,8 +78,8 @@ a.quiet{color:var(--ink2);font-size:14px;margin-left:14px}
 .live{border-color:var(--pos);color:var(--pos)}
 .stale{border-color:var(--neg);color:var(--neg)}
 button.danger{font:inherit;font-size:14px;font-weight:600;padding:9px 18px;
-  border-radius:8px;border:1px solid var(--neg);background:none;color:var(--neg)}
-button.danger:hover{background:var(--neg);color:#fff;filter:none}
+  border-radius:8px;border:1px solid var(--pos);background:none;color:var(--pos)}
+button.danger:hover{background:var(--pos);color:#fff;filter:none}
 label{display:block;font-weight:600;font-size:13.5px;margin:0 0 5px}
 .field{margin:0 0 20px}
 .hint{color:var(--muted);font-size:12.5px;margin:5px 0 0;font-weight:400}
@@ -341,33 +346,10 @@ def render_trash(root):
                 'these for good — there is no second copy. To keep one, move it '
                 'back out of <code>%s/</code> first.</p></div>' % html.escape(TRASH))
     body.append('<p><form method="post" action="/trash/empty" style="display:inline">'
-                '<button type="submit" class="danger">Empty trash (%d)</button>'
+                '<button type="submit" class="trash" style="margin-left:0">'
+                'Empty trash (%d)</button>'
                 '</form> <a href="/" class="quiet">Leave it</a></p>' % len(rows))
     return _page("Trash — Roundtable", "\n".join(body))
-
-
-def render_delete(root, name, sp=None):
-    """The confirmation page. A GET, so nothing is destroyed by following a link."""
-    name = _safe_name(name)
-    rows = [r for r in list_sessions(root) if r["name"] == name]
-    if not rows:
-        return None
-    r = rows[0]
-    body = [
-        "<h1>Remove this session?</h1>",
-        '<p class="sub">%s</p>' % html.escape(name),
-        '<div class="card"><p class="note">%d run(s), %d judge verdict(s), '
-        'last written %s. It moves to <code>%s/</code> inside the sessions '
-        'directory rather than being deleted, so you can put it back by hand.'
-        '</p></div>'
-        % (r["runs"], r["judges"],
-           time.strftime("%Y-%m-%d %H:%M", time.localtime(r["mtime"])), TRASH),
-        '<p><form method="post" action="/delete" style="display:inline">'
-        '<input type="hidden" name="session" value="%s">'
-        '<button type="submit" class="danger">Remove it</button></form> '
-        '<a href="/" class="quiet">Keep it</a></p>' % html.escape(name),
-    ]
-    return _page("Remove %s — Roundtable" % name, "\n".join(body))
 
 
 def render_index(root, sp=None, notice=None):
@@ -413,7 +395,10 @@ def render_index(root, sp=None, notice=None):
                  'border-radius:8px">New run</a>%s</p>'
                  # Only shown when there is something in it: an "Empty trash (0)"
                  # sitting there permanently is a button that does nothing.
-                 % ('<a href="/trash" class="quiet">Empty trash (%d)</a>' % binned
+                 # A button, not a link, but it opens the trash page rather
+                 # than emptying on click: everything else here is undoable and
+                 # this is not. The page it opens is where the deletion happens.
+                 % ('<a href="/trash" class="trash">Empty trash (%d)</a>' % binned
                     if binned else ""))
 
     card = _job_card(jobs, notice)
@@ -449,9 +434,14 @@ def render_index(root, sp=None, notice=None):
                     '<a class="go" href="/new?from=%s" title="Open the form with '
                     'these prompts filled in, so you can change the models and '
                     'settings before running">Rerun prompts only</a>'
-                    '<a class="del" href="/delete/%s" title="Move this session '
-                    'to the trash folder">Remove</a>%s</span>'
-                    % (html.escape(r["name"]), name, name,
+                    # A POST, not a link: this acts on the first click, and a
+                    # prefetcher following a GET must never be able to bin a
+                    # session. The undo is the trash folder, not a confirm step.
+                    '<form method="post" action="/delete">'
+                    '<input type="hidden" name="session" value="%s">'
+                    '<button type="submit" class="del" title="Move this session '
+                    'to the trash folder">Remove</button></form>%s</span>'
+                    % (html.escape(r["name"]), name, html.escape(r["name"]),
                        # Rewrites the report without the reload tag, so a run
                        # that died stops pretending it is still going.
                        ('<a href="/rebuild/%s" title="Rewrite this report as a '
@@ -1301,11 +1291,6 @@ def make_handler(root, sp=None):
                 return self._send(200, page)
             if path == "/trash":
                 return self._send(200, render_trash(root))
-            if path.startswith("/delete/"):
-                page = render_delete(root, path[len("/delete/"):].strip("/"), sp)
-                if page is None:
-                    return self._error(404, "No such session.")
-                return self._send(200, page)
             if path.startswith("/rebuild/"):
                 name = path[len("/rebuild/"):].strip("/")
                 if not rebuild_session(root, name, sp):
