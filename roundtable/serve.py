@@ -8,6 +8,7 @@ refreshes itself.
 Binds to localhost by default. Serving is read-only and confined to the sessions
 root -- see ``_resolve``, which is the one security-relevant function in here.
 """
+import errno
 import html
 import json
 import mimetypes
@@ -23,6 +24,10 @@ from . import models as models_mod
 from . import model_cards as model_cards_mod
 from . import presets as presets_mod
 from . import report, session as session_mod, spool
+
+class AlreadyRunning(RuntimeError):
+    """The port is taken, almost always by another copy of this app."""
+
 
 DEFAULT_PORT = 8420
 DEFAULT_HOST = "127.0.0.1"
@@ -1531,19 +1536,48 @@ def make_handler(root, sp=None):
     return Handler
 
 
+def _root(root):
+    return os.path.realpath(root or session_mod.__dict__.get(
+        "DEFAULT_SESSIONS", os.path.expanduser("~/Apps/creative-bench")))
+
+
+def bind(root=None, host=DEFAULT_HOST, port=DEFAULT_PORT, sp=None):
+    """Take the port. -> a server ready to serve, or raise AlreadyRunning.
+
+    Separate from serve() so a caller that starts other things (the worker, in
+    ``roundtable up``) can find out the port is taken BEFORE starting them.
+    """
+    root = _root(root)
+    os.makedirs(root, exist_ok=True)
+    try:
+        httpd = ThreadingHTTPServer((host, port), make_handler(root, sp))
+    except OSError as exc:
+        # Starting it twice is the ordinary way to hit this, and a traceback
+        # about socket.bind reads like the app broke rather than like it is
+        # already up.
+        if exc.errno != errno.EADDRINUSE:
+            raise
+        raise AlreadyRunning(
+            "Roundtable is already serving on http://%s:%d/ — open that, or "
+            "stop the other one first (Ctrl-C in its terminal, or: pkill -f "
+            "'roundtable up'). Use --port to run a second copy alongside it."
+            % (host, port)) from None
+    httpd.daemon_threads = True
+    httpd.roundtable_root = root
+    return httpd
+
+
 def serve(root=None, host=DEFAULT_HOST, port=DEFAULT_PORT, sp=None, log=print,
-          open_browser=False):
+          open_browser=False, httpd=None):
     """Run the server until interrupted. -> None.
 
     ``open_browser`` is off by default because this same function backs the
     systemd service (no display to open anything on) as well as interactive
     use -- only the CLI's interactive entry points turn it on.
     """
-    root = os.path.realpath(root or session_mod.__dict__.get(
-        "DEFAULT_SESSIONS", os.path.expanduser("~/Apps/creative-bench")))
-    os.makedirs(root, exist_ok=True)
-    httpd = ThreadingHTTPServer((host, port), make_handler(root, sp))
-    httpd.daemon_threads = True
+    httpd = httpd or bind(root, host=host, port=port, sp=sp)
+    root = getattr(httpd, "roundtable_root", _root(root))
+    host = httpd.server_address[0]
     url = "http://%s:%d/" % (host, httpd.server_address[1])
     log("serving %s at %s" % (root, url))
     if open_browser:

@@ -114,8 +114,12 @@ def _sessions_root(args):
 
 
 def cmd_serve(args):
-    serve.serve(root=_sessions_root(args), host=args.host, port=args.port,
-                sp=args.spool, open_browser=not args.no_browser)
+    try:
+        serve.serve(root=_sessions_root(args), host=args.host, port=args.port,
+                    sp=args.spool, open_browser=not args.no_browser)
+    except serve.AlreadyRunning as exc:
+        print(exc, file=sys.stderr)
+        return 1
     return 0
 
 
@@ -137,12 +141,20 @@ def cmd_up(args):
         except Exception as exc:                     # keep the server alive
             print("worker crashed: %r" % exc, file=sys.stderr)
 
+    # Bind before starting the worker: an "already running" exit should not
+    # leave a second worker briefly claiming jobs from the first one's queue.
+    try:
+        httpd = serve.bind(root, host=args.host, port=args.port, sp=args.spool)
+    except serve.AlreadyRunning as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
     thread = threading.Thread(target=work, name="roundtable-worker", daemon=True)
     thread.start()
     print("worker running in-process · Ctrl-C to stop both")
     try:
-        serve.serve(root=root, host=args.host, port=args.port, sp=args.spool,
-                   open_browser=not args.no_browser)
+        serve.serve(root=root, sp=args.spool, httpd=httpd,
+                    open_browser=not args.no_browser)
     finally:
         stop.set()
         thread.join(timeout=35)
