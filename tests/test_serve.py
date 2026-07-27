@@ -389,6 +389,44 @@ class LiveServerTests(unittest.TestCase):
         self.assertEqual(self.get("/delete/20260101-000014")[0], 404)
         self.assertTrue(os.path.isdir(os.path.join(self.root, "20260101-000014")))
 
+    # --- what a failed job says ------------------------------------------
+
+    def _failed(self, job_id, error, log_text=None, **extra):
+        record = {"id": job_id, "state": "failed", "error": error}
+        record.update(extra)
+        spool.write_atomic(os.path.join(self.spool, "failed", job_id + ".json"),
+                           json.dumps(record))
+        if log_text is not None:
+            spool.write_atomic(os.path.join(self.spool, "logs", job_id + ".log"),
+                               log_text)
+
+    def test_failure_page_names_the_cause(self):
+        """Not 'see the job log' — the app has the log, it can read it."""
+        self._failed("boom", "runner exited 1",
+                     "loading model...\nTraceback (most recent call last):\n"
+                     "  File \"<string>\", line 3\n"
+                     "ImportError: cannot import name 'model_cards'\n")
+        status, page, _ = self.get("/job/boom")
+        self.assertEqual(status, 200)
+        self.assertIn("ImportError: cannot import name", page)
+        self.assertNotIn("See the job log under the spool directory", page)
+
+    def test_failure_page_falls_back_to_the_tail(self):
+        self._failed("quiet", "runner exited 2", "step one\nstep two\nstep three\n")
+        _, page, _ = self.get("/job/quiet")
+        self.assertIn("step three", page)
+
+    def test_failure_page_copes_with_no_log(self):
+        self._failed("nolog", "runner exited 127")
+        _, page, _ = self.get("/job/nolog")
+        self.assertIn("No log was written", page)
+
+    def test_a_cancelled_job_does_not_read_as_a_crash(self):
+        self._failed("stopped", "cancelled", "", cancelled=True)
+        _, page, _ = self.get("/job/stopped")
+        self.assertIn("Cancelled", page)
+        self.assertNotIn("Last lines", page)
+
     # --- the trash --------------------------------------------------------
 
     def test_trash_count_appears_only_when_something_is_in_it(self):

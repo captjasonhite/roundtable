@@ -141,7 +141,13 @@ REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-3600}"
 # page's "New run" form) -- not hardcoded here -- so editing a card on the page
 # changes what the next bench run actually uses. See roundtable/model_cards.py.
 CARD_SETTINGS="${CARD_SETTINGS:-1}"
-ROUNDTABLE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# readlink -f, not dirname alone: this script is normally reached through a
+# symlink on PATH (~/Apps/bin/creative-bench.sh -> the repo). Taking the
+# dirname of the LINK put PYTHONPATH one level above the package, where
+# "roundtable" resolves to the repo directory instead — a namespace package
+# with no model_cards in it. Silent for a day: every run fell back to script
+# defaults and said so only in a frontmatter field nobody reads.
+ROUNDTABLE_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 
 card_settings() {  # card_settings <model-path> <thinking|nothinking>
   # sets C_TEMP C_TOP_P C_TOP_K C_MIN_P C_REP C_PRES C_PROFILE C_THINKS
@@ -180,7 +186,18 @@ text = ("%s card" % label if same
         else "%s card / %s" % (label, "thinking-general" if mode == "thinking"
                                 else "instruct-general"))
 print("C_PROFILE=%s" % shlex.quote(text))
-' "$m" "$mode")"
+' "$m" "$mode" 2>&1)" || true
+  # An empty answer means "no card for this model", which is normal and leaves
+  # the script defaults in place. Anything that isn't C_*= assignments means the
+  # card lookup itself is broken — refusing to start is the point: benchmarking
+  # six models on one set of defaults while the report claims per-model card
+  # settings is worse than not running at all.
+  if [[ -n "$out" && ! "$out" =~ ^C_[A-Z_]+= ]]; then
+    echo "  ✗ model cards could not be read — refusing to run with the wrong samplers" >&2
+    echo "    PYTHONPATH=$ROUNDTABLE_ROOT" >&2
+    printf '    %s\n' "$out" >&2
+    exit 1
+  fi
   [[ -n "$out" ]] && eval "$out"
 }
 

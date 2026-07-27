@@ -1146,6 +1146,46 @@ def active_jobs(sp=None):
     return out
 
 
+def job_failure(job_id, sp=None):
+    """Why a job failed, in words. -> str.
+
+    "See the job log under the spool directory" was the old answer: the app
+    knows the exit code, holds the log, and can read the last error out of it,
+    and instead sent the reader off to find a path it didn't even name. If this
+    can't identify the cause it says so and quotes the tail, which is still
+    strictly more than a filename.
+    """
+    p = spool.paths(sp)
+    record = spool.read_job(os.path.join(p["failed"], job_id + ".json"))
+    reason = str(record.get("error") or "The run did not finish.")
+    if record.get("cancelled"):
+        return "Cancelled before it finished. Whatever had completed is kept."
+    if record.get("reaped"):
+        return reason
+
+    log_path = record.get("log") or os.path.join(p["logs"], job_id + ".log")
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            lines = [l.rstrip() for l in f.read().splitlines() if l.strip()]
+    except OSError:
+        return "%s No log was written — the runner may not have started." % reason
+
+    # A traceback's last line, or the last line the script complained about:
+    # the one line worth putting in front of someone.
+    cause = ""
+    for line in reversed(lines):
+        if (line.startswith(("Traceback", "  File ")) or line.startswith("    ")):
+            continue
+        if any(k in line for k in ("Error", "error:", "✗", "No such file",
+                                   "not found", "Permission denied", "refus")):
+            cause = line
+            break
+    tail = " · ".join(lines[-3:])[:400]
+    if cause:
+        return "%s\n\n%s\n\nLast lines: %s" % (reason, cause, tail)
+    return "%s\n\nLast lines: %s" % (reason, tail)
+
+
 def render_job(job_id, root, sp=None):
     """The waiting page: redirects itself to the report once one exists."""
     state, session_dir = find_job_session(job_id, sp)
@@ -1177,8 +1217,7 @@ def render_job(job_id, root, sp=None):
             "machine or the worker went down mid-run. Clearing it files the job "
             "as failed and settles its report; whatever finished is kept.")
     elif state == "failed":
-        headline, detail = "Failed", (
-            "The run did not finish. See the job log under the spool directory.")
+        headline, detail = "Failed", job_failure(job_id, sp)
     elif state == "done":
         headline, detail = "Finished", "No report was produced for this run."
     else:
@@ -1187,7 +1226,8 @@ def render_job(job_id, root, sp=None):
     body = ["<h1>%s</h1>" % html.escape(headline),
             '<p class="sub">job %s · worker %s</p>'
             % (html.escape(job_id), html.escape(str(beat.get("state", "unknown")))),
-            '<div class="card"><p class="note">%s</p></div>' % html.escape(detail)]
+            '<div class="card"><p class="note" style="white-space:pre-wrap">%s'
+            '</p></div>' % html.escape(detail)]
     if state in ("queued", "running", "stopped"):
         body.append(
             '<p><form method="post" action="/cancel" style="margin:0 0 16px">'
