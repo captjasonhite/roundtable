@@ -878,7 +878,7 @@ def render(session, result, rankings, running=False, refresh=15,
     body.append('<p class="sub">%s · generated %s%s · '
                 '<a href="/rebuild/%s" title="Regenerate this page — useful if '
                 'Roundtable was updated since this session finished">&#8635; '
-                'rebuild</a> · <a href="/new">+ new run</a></p>'
+                'rebuild</a> · <a href="/?tab=new">+ new run</a></p>'
                 % (esc(" · ".join(bits)), stamp,
                    " · <b>running</b>, this page reloads itself" if running else "",
                    esc(session["name"])))

@@ -158,8 +158,42 @@ class LiveServerTests(unittest.TestCase):
         self.assertIn("No sessions yet", body)
         self.assertIn("New run", body)
 
+    def test_index_carries_all_three_tabs_on_one_page(self):
+        """Results, New run and Queue are panels of the index, not pages."""
+        status, body, _ = self.get("/")
+        self.assertEqual(status, 200)
+        for tab in ("results", "new", "queue"):
+            self.assertIn('data-tab="%s"' % tab, body)
+            self.assertIn('id="tab-%s"' % tab, body)
+        # The form is really there, not a link to somewhere else.
+        self.assertIn('action="/submit"', body)
+        self.assertIn('id="user_prompt"', body)
+        # Results is what you land on.
+        self.assertIn('<div class="panel" id="tab-results"', body)
+        self.assertIn('<div class="panel off" id="tab-new"', body)
+
+    def test_tab_query_param_picks_the_open_panel(self):
+        _, body, _ = self.get("/?tab=new")
+        self.assertIn('<div class="panel" id="tab-new"', body)
+        self.assertIn('<div class="panel off" id="tab-results"', body)
+        self.assertIn('class="tab on" role="tab" data-tab="new"', body)
+
+    def test_unknown_tab_falls_back_to_results(self):
+        _, body, _ = self.get("/?tab=nonsense")
+        self.assertIn('<div class="panel" id="tab-results"', body)
+
+    def test_the_form_has_no_page_of_its_own(self):
+        """It is a tab now. Nothing in the app links to /new any more."""
+        self.assertEqual(self.get("/new")[0], 404)
+
+    def test_a_rejected_submission_comes_back_on_the_new_tab(self):
+        status, body, _ = self.get("/submit", "POST", "user_prompt=")
+        self.assertEqual(status, 400)
+        self.assertIn('<div class="panel" id="tab-new"', body)
+        self.assertIn('class="err"', body)
+
     def test_index_and_new_page_reference_the_logo_and_favicon(self):
-        for path in ("/", "/new"):
+        for path in ("/", "/?tab=new"):
             status, body, _ = self.get(path)
             self.assertEqual(status, 200)
             self.assertIn("/assets/logo.png", body)
@@ -181,7 +215,7 @@ class LiveServerTests(unittest.TestCase):
         self.assertIn(status, (403, 404))
 
     def test_form_lists_presets(self):
-        status, body, _ = self.get("/new")
+        status, body, _ = self.get("/?tab=new")
         self.assertEqual(status, 200)
         self.assertIn("Line &amp; Copy Editor", body)
         self.assertIn("Red Team", body)
@@ -270,6 +304,16 @@ class LiveServerTests(unittest.TestCase):
         self.assertIn(">stopped</span>", body)
         # ...and the index itself must stop reloading every 15 seconds.
         self.assertNotIn('http-equiv="refresh"', body)
+        self.assertIn("reloadMs = 0", body)
+
+    def test_a_live_index_reloads_by_timer_not_by_meta_refresh(self):
+        """The New run tab holds a draft, so the reload has to be skippable."""
+        live = self._session_dir("20260101-000009", True)
+        spool.heartbeat(self.spool, state="running", job="j", session=live)
+        _, body, _ = self.get("/")
+        self.assertNotIn('http-equiv="refresh"', body)
+        self.assertIn("reloadMs = 15000", body)
+        self.assertIn("do not eat a draft", body)
 
     # --- cancelling and cleaning up -----------------------------------------
 
@@ -377,7 +421,7 @@ class LiveServerTests(unittest.TestCase):
     def test_rerun_controls_carry_the_primary_style(self):
         self.session("20260101-000013")
         _, body, _ = self.get("/")
-        self.assertIn('<a class="go" href="/new?from=', body)
+        self.assertIn('<a class="go" href="/?tab=new&amp;from=', body)
         self.assertIn('<button type="submit" class="del"', body)
 
     def test_remove_is_a_post_not_a_link(self):
@@ -512,7 +556,62 @@ class LiveServerTests(unittest.TestCase):
         _, body, _ = self.get("/")
         self.assertIn('action="/rerun"', body)
         self.assertIn(">Rerun<", body)
-        self.assertIn("/new?from=20260101-000001", body)
+        self.assertIn("/?tab=new&amp;from=20260101-000001", body)
+
+    # --- re-judging ---------------------------------------------------------
+
+    def test_index_offers_a_rejudge_link(self):
+        self.session("20260101-000031")
+        _, body, _ = self.get("/")
+        self.assertIn("/rejudge?session=20260101-000031", body)
+        self.assertIn(">Re-judge</a>", body)
+
+    def test_rejudge_page_names_the_session_and_posts_back(self):
+        self.session("20260101-000032")
+        status, page, _ = self.get("/rejudge?session=20260101-000032")
+        self.assertEqual(status, 200)
+        self.assertIn("20260101-000032", page)
+        self.assertIn('action="/rejudge"', page)
+        self.assertIn('name="judges"', page)
+        self.assertIn('name="meta_summary"', page)
+
+    def test_rejudge_page_for_an_unknown_session_404s(self):
+        self.assertEqual(self.get("/rejudge?session=nope")[0], 404)
+
+    def test_rejudge_queues_a_judge_only_job(self):
+        path = self.session("20260101-000033")
+        status, _, headers = self.get(
+            "/rejudge", "POST",
+            "session=20260101-000033&judges=outsider-13B&judges=other-8B"
+            "&meta_summary=1")
+        self.assertEqual(status, 303)
+        self.assertTrue(headers["Location"].startswith("/job/"))
+        queued = spool.pending(self.spool)
+        self.assertEqual(len(queued), 1)
+        with open(os.path.join(self.spool, "queue", queued[0])) as f:
+            job = json.load(f)
+        self.assertEqual(job["judge_only"], path)
+        self.assertEqual(job["judges"], ["outsider-13B", "other-8B"])
+        self.assertTrue(job["meta_summary"])
+        self.assertEqual(job["rejudge_of"], "20260101-000033")
+        # No prompts and no models: nothing is generated a second time.
+        self.assertNotIn("user_prompt", job)
+        self.assertNotIn("models", job)
+
+    def test_rejudge_with_no_judges_picked_is_refused(self):
+        self.session("20260101-000034")
+        status, page, _ = self.get("/rejudge", "POST",
+                                   "session=20260101-000034&meta_summary=1")
+        self.assertEqual(status, 400)
+        self.assertIn("at least one judge", page)
+        self.assertEqual(spool.counts(self.spool)["queue"], 0)
+
+    def test_rejudge_cannot_escape_the_sessions_root(self):
+        for attempt in ("../../etc", "/etc", "..%2f..%2fetc"):
+            status, _, _ = self.get(
+                "/rejudge", "POST",
+                "session=%s&judges=x" % urllib.parse.quote(attempt))
+            self.assertEqual(status, 404, attempt)
 
     def test_rerun_queues_the_recorded_job(self):
         """The job record is the better source: it holds what was asked for,
@@ -577,7 +676,7 @@ class LiveServerTests(unittest.TestCase):
                              "user_prompt": "write a haiku",
                              "system_prompt": "be brief",
                              "models": ["alpha:thinking"], "summarize": True})
-        status, page, _ = self.get("/new?from=20260101-000001")
+        status, page, _ = self.get("/?tab=new&from=20260101-000001")
         self.assertEqual(status, 200)
         self.assertIn("write a haiku", page)
         self.assertIn("be brief", page)
@@ -588,7 +687,7 @@ class LiveServerTests(unittest.TestCase):
         self.assertEqual(spool.counts(self.spool)["queue"], 0)
 
     def test_prompts_only_from_an_unknown_session_404s(self):
-        status, _, _ = self.get("/new?from=nope")
+        status, _, _ = self.get("/?tab=new&from=nope")
         self.assertEqual(status, 404)
 
 
@@ -645,7 +744,7 @@ class PresetRouteTests(unittest.TestCase):
         self.assertTrue(data["ok"])
         self.assertEqual(data["id"], "my-custom-role")
 
-        status, page, _ = self.get("/new")
+        status, page, _ = self.get("/?tab=new")
         self.assertIn(b"My Custom Role", page)
 
     def test_save_missing_prompt_is_rejected(self):
@@ -656,13 +755,13 @@ class PresetRouteTests(unittest.TestCase):
     def test_new_page_with_preset_query_prefills_system_prompt(self):
         self.get("/presets/save", "POST",
                 "title=My+Custom+Role&system_prompt=be+concise+please")
-        status, page, _ = self.get("/new?preset=my-custom-role")
+        status, page, _ = self.get("/?tab=new&preset=my-custom-role")
         self.assertEqual(status, 200)
         self.assertIn(b"be concise please", page)
         self.assertIn(b'value="my-custom-role" selected', page)
 
     def test_notice_query_param_is_shown(self):
-        status, page, _ = self.get("/new?notice=Saved+it")
+        status, page, _ = self.get("/?tab=new&notice=Saved+it")
         self.assertIn(b"Saved it", page)
         self.assertIn(b'class="notice"', page)
 
@@ -673,7 +772,7 @@ class PresetRouteTests(unittest.TestCase):
         self.assertTrue(data["deleted"])
         self.assertFalse(data["reverted"])            # not a bundled id
 
-        status, page, _ = self.get("/new")
+        status, page, _ = self.get("/?tab=new")
         self.assertNotIn(b">Temp<", page)
 
     def test_delete_missing_id_is_rejected(self):

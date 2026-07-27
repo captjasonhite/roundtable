@@ -152,6 +152,25 @@ button.ghost{background:none;color:var(--series);border:1px solid var(--border);
 .mc-fields label{display:block;font-size:11px;font-weight:400;color:var(--muted);
   margin:0 0 3px}
 .mc-fields input{padding:6px 7px;font-size:13px}
+/* The three tabs. Underlined rather than boxed: they sit directly on top of
+   the cards below them, and a second box around a box reads as a dialog. */
+.tabs{display:flex;gap:4px;margin:0 0 20px;
+  border-bottom:1px solid var(--border)}
+.tabs .tab{font:inherit;font-size:14.5px;font-weight:600;background:none;
+  color:var(--ink2);border:none;border-bottom:2px solid transparent;
+  border-radius:0;padding:10px 16px;margin-bottom:-1px;cursor:pointer}
+.tabs .tab:hover{color:var(--series);filter:none}
+.tabs .tab.on{color:var(--series);border-bottom-color:var(--series)}
+.tabs .tabn{display:inline-block;margin-left:7px;font-size:11.5px;
+  font-weight:600;color:var(--ink2);background:var(--grid);border-radius:999px;
+  padding:1px 7px;font-variant-numeric:tabular-nums}
+.tabs .tab.on .tabn{color:#fff;background:var(--series)}
+.panel.off{display:none}
+.trash-line{margin:18px 0 0}
+.trash-line .trash{margin-left:0}
+@media (max-width:640px){
+  .tabs .tab{flex:1;padding:10px 6px;font-size:13.5px}
+}
 """
 
 
@@ -211,14 +230,11 @@ def list_sessions(root):
     return out
 
 
-def _job_card(jobs, notice=None):
+def _job_card(jobs):
     """The "in flight" card: what is queued or running, and how to stop it."""
     parts = []
-    if notice:
-        parts.append('<div class="card"><p class="note">%s</p></div>'
-                     % html.escape(notice))
     if not jobs:
-        return "\n".join(parts)
+        return ""
     parts.append('<div class="card">')
     for job in jobs:
         if job["stale"]:
@@ -330,6 +346,82 @@ def empty_trash(root):
                      else "The trash was already empty.")
 
 
+def render_rejudge(root, name, models_root=None, error=None):
+    """Pick a new panel for a session that has already been judged.
+
+    A page of its own rather than a tab: it acts on one session, and the New
+    run tab is about starting a contest, not re-scoring a finished one.
+    """
+    name = _safe_name(name)
+    sdir = os.path.join(root, name) if name else None
+    if not sdir or not os.path.isdir(sdir):
+        return None
+    data = session_mod.load(sdir)
+    if not data:
+        return None
+
+    ran = {r["model"] for r in data["runs"]}
+    judged = [j["judge"] for j in data["judges"]]
+
+    body = ["<h1>Re-judge</h1>",
+            '<p class="sub">%s · %d output(s), %d judge(s) now. '
+            '<a href="/">All sessions</a></p>'
+            % (html.escape(name), len(data["runs"]), len(judged))]
+    if error:
+        body.append('<div class="err">%s</div>' % html.escape(error))
+    body.append('<form method="post" action="/rejudge">'
+                '<input type="hidden" name="session" value="%s">'
+                '<div class="card">' % html.escape(name))
+    body.append('<p class="note">Round 2 again over the same outputs, with a '
+                'panel you choose. Nothing is generated a second time — the '
+                'judges read what is already here. A panel drawn from the '
+                'field is a field grading its own relatives; naming outsiders '
+                'is how you find out whether the standings survive it.</p>')
+    if judged:
+        body.append('<p class="hint">Judged so far by: %s. Those verdicts move '
+                    'into <code>.judges-N/</code> inside the session when the '
+                    'new panel runs — kept, but out of the scoring.</p>'
+                    % html.escape(", ".join(report.short_model(j, 34)
+                                            for j in judged)))
+
+    found = models_mod.discover(models_root)
+    body.append('<div class="field"><label>Judges</label>')
+    if not found:
+        body.append('<p class="hint">No .gguf files found under <code>%s</code>.'
+                    '</p>' % html.escape(models_root or models_mod.DEFAULT_ROOT))
+    else:
+        body.append('<div class="checks">')
+        for m in found:
+            # Both sides are the name naming.py derives from the GGUF path --
+            # the runs' frontmatter and the discovery listing agree by
+            # construction, so this is an equality test, not a fuzzy match.
+            competed = m["name"] in ran
+            body.append('<label class="check"><input type="checkbox" '
+                        'name="judges" value="%s"><code>%s</code>%s'
+                        '<span class="sz">%.1f GB</span></label>'
+                        % (html.escape(m["name"]), html.escape(m["name"]),
+                           '<span class="pill">ran here</span>' if competed else "",
+                           m["size_gb"]))
+        body.append("</div>")
+        body.append('<p class="hint">Each one loads once and ranks every output. '
+                    'A judge that competed here can see its own entry — blind, '
+                    'but its own prose.</p>')
+    body.append("</div>")
+
+    body.append('<div class="field"><label class="check">'
+                '<input type="checkbox" name="meta_summary" value="1" checked> '
+                'Round 3 &mdash; have the new panel&rsquo;s top pick write a '
+                'final synthesis</label><p class="hint">The old synthesis, if '
+                'there is one, is archived with the old verdicts: it summarised '
+                'standings that no longer hold.</p></div>')
+
+    body.append('<div class="actions">'
+                '<button type="submit">Queue re-judge</button>'
+                '<a class="quiet" href="/">Cancel</a></div>')
+    body.append("</div></form>")
+    return _page("Re-judge %s — Roundtable" % name, "\n".join(body))
+
+
 def render_trash(root):
     """The bin, and the one button in the app that destroys anything."""
     rows = trash_list(root)
@@ -357,7 +449,14 @@ def render_trash(root):
     return _page("Trash — Roundtable", "\n".join(body))
 
 
-def render_index(root, sp=None, notice=None):
+def render_index(root, sp=None, notice=None, tab=None, form_values=None,
+                 form_error=None, models_root=None):
+    """The whole app in three tabs: Results, New run, Queue.
+
+    One page, three panels, rendered together and switched client-side. The
+    form is not a separate page any more: queuing a run is the main thing this
+    app does, and it used to cost a navigation away from the results.
+    """
     counts = spool.counts(sp)
     beat = spool.read_heartbeat(sp) or {}
     rows = list_sessions(root)
@@ -373,12 +472,17 @@ def render_index(root, sp=None, notice=None):
         r["stalled"] = r["live"] and r["name"] not in live_dirs
         r["live"] = r["live"] and r["name"] in live_dirs
 
-    parts = ['<!doctype html><html lang="en"><head><meta charset="utf-8">',
-             '<meta name="viewport" content="width=device-width,initial-scale=1">']
     # Stale claims are excluded deliberately: a page that reloads every 15
     # seconds forever is exactly the symptom of the bug this repairs.
-    if any(r["live"] for r in rows) or any(not j["stale"] for j in jobs):
-        parts.append('<meta http-equiv="refresh" content="15">')
+    reloading = any(r["live"] for r in rows) or any(not j["stale"] for j in jobs)
+
+    tab = tab if tab in ("results", "new", "queue") else "results"
+
+    parts = ['<!doctype html><html lang="en"><head><meta charset="utf-8">',
+             '<meta name="viewport" content="width=device-width,initial-scale=1">']
+    # No <meta refresh>: the New run tab holds a half-typed prompt, and a
+    # declarative reload would throw it away mid-sentence with no way to hold
+    # it off. The timer at the foot of this page does the same job and can.
     parts.append("<title>Roundtable</title>%s<style>%s</style></head><body>"
                  "<div class=\"wrap\">" % (FAVICON_HEAD, INDEX_CSS))
     parts.append(LOGO_HTML)
@@ -394,25 +498,32 @@ def render_index(root, sp=None, notice=None):
                  % (html.escape(" · ".join(bits)), len(rows), html.escape(root)))
 
     binned = len(trash_list(root))
-    parts.append('<p style="margin:0 0 20px"><a href="/new" style="display:'
-                 'inline-block;background:var(--series);color:#fff;font-weight:600;'
-                 'font-size:14.5px;text-decoration:none;padding:11px 22px;'
-                 'border-radius:8px">New run</a>%s</p>'
-                 # Only shown when there is something in it: an "Empty trash (0)"
-                 # sitting there permanently is a button that does nothing.
-                 # A button, not a link, but it opens the trash page rather
-                 # than emptying on click: everything else here is undoable and
-                 # this is not. The page it opens is where the deletion happens.
-                 % ('<a href="/trash" class="trash">Empty trash (%d)</a>' % binned
-                    if binned else ""))
 
-    card = _job_card(jobs, notice)
-    if card:
-        parts.append(card)
+    if notice:
+        # Above the tabs, not inside one: a notice is usually the result of an
+        # action taken on a different tab from the one now showing.
+        parts.append('<div class="notice">%s</div>' % html.escape(notice))
+
+    # The tab bar. Buttons, not links: switching tabs is not a navigation, and
+    # the New run tab holds unsaved text that a real page load would discard.
+    waiting = len(jobs)
+    parts.append('<nav class="tabs" role="tablist">')
+    for key, label, count in (("results", "Results", len(rows)),
+                              ("new", "New run", None),
+                              ("queue", "Queue", waiting)):
+        parts.append('<button type="button" class="tab%s" role="tab" '
+                     'data-tab="%s" aria-selected="%s">%s%s</button>'
+                     % (" on" if key == tab else "", key,
+                        "true" if key == tab else "false", label,
+                        '<span class="tabn">%d</span>' % count if count else ""))
+    parts.append("</nav>")
+
+    parts.append('<div class="panel%s" id="tab-results" role="tabpanel">'
+                 % ("" if tab == "results" else " off"))
 
     if not rows:
         parts.append('<div class="card"><p class="note">No sessions yet. '
-                     'Start one with <b>New run</b> above.</p></div>')
+                     'Start one on the <b>New run</b> tab.</p></div>')
     else:
         parts.append('<div class="card">')
         for r in rows:
@@ -436,9 +547,14 @@ def render_index(root, sp=None, notice=None):
                     '<button type="submit" title="Queue this exact run again — '
                     'same prompts, same models, same settings">Rerun</button>'
                     '</form>'
-                    '<a class="go" href="/new?from=%s" title="Open the form with '
+                    '<a class="go" href="/?tab=new&amp;from=%s" title="Open the form with '
                     'these prompts filled in, so you can change the models and '
                     'settings before running">Rerun prompts only</a>'
+                    # No outputs are regenerated, so this is cheap next to a
+                    # rerun -- and it is the only way to ask whether the
+                    # standings hold up under a panel that isn't the field.
+                    '<a class="go" href="/rejudge?session=%s" title="Judge these '
+                    'same outputs again with a panel you choose">Re-judge</a>'
                     # A POST, not a link: this acts on the first click, and a
                     # prefetcher following a GET must never be able to bin a
                     # session. The undo is the trash folder, not a confirm step.
@@ -446,7 +562,7 @@ def render_index(root, sp=None, notice=None):
                     '<input type="hidden" name="session" value="%s">'
                     '<button type="submit" class="del" title="Move this session '
                     'to the trash folder">Remove</button></form>%s</span>'
-                    % (html.escape(r["name"]), name, html.escape(r["name"]),
+                    % (html.escape(r["name"]), name, name, html.escape(r["name"]),
                        # Rewrites the report without the reload tag, so a run
                        # that died stops pretending it is still going.
                        ('<a href="/rebuild/%s" title="Rewrite this report as a '
@@ -460,9 +576,83 @@ def render_index(root, sp=None, notice=None):
                             acts))
         parts.append("</div>")
 
+    if binned:
+        # Only shown when there is something in it: an "Empty trash (0)" sitting
+        # there permanently is a button that does nothing. It lives at the foot
+        # of the results, next to the sessions it holds, rather than earning a
+        # tab of its own for something done twice a year. And it opens the
+        # trash page rather than emptying on click: everything else here is
+        # undoable and this is not, so the confirmation page is the action.
+        parts.append('<p class="trash-line"><a href="/trash" class="trash">'
+                     'Empty trash (%d)</a></p>' % binned)
+    parts.append("</div>")                                     # /tab-results
+
+    parts.append('<div class="panel%s" id="tab-new" role="tabpanel">'
+                 % ("" if tab == "new" else " off"))
+    parts.append(form_fragment(error=form_error, values=form_values,
+                               models_root=models_root))
+    parts.append("</div>")                                     # /tab-new
+
+    parts.append('<div class="panel%s" id="tab-queue" role="tabpanel">'
+                 % ("" if tab == "queue" else " off"))
+    card = _job_card(jobs)
+    if card:
+        parts.append(card)
+    else:
+        parts.append('<div class="card"><p class="note">Nothing queued or '
+                     'running. A run you queue lands here until the worker '
+                     'picks it up — they are run one at a time, oldest '
+                     'first.</p></div>')
+    parts.append('<p class="hint">Worker %s · %d done%s since it started.</p>'
+                 % (html.escape(worker_state), counts["done"],
+                    ", %d failed" % counts["failed"] if counts["failed"] else ""))
+    parts.append("</div>")                                     # /tab-queue
+
     parts.append("<footer>Reports are static files. A running session&rsquo;s report "
                  "reloads itself until it finishes.</footer>")
+    parts.append(_TABS_JS % json.dumps(15000 if reloading else 0))
     return "\n".join(parts) + "\n</div></body></html>\n"
+
+
+# Tab switching, plus the reload that <meta refresh> used to do. The reload is
+# held off while the New run tab is showing: it is a form, and a page that
+# replaces itself every 15 seconds cannot be typed into. The tab is remembered
+# in the URL so the reload -- and the browser's back button -- come back to it.
+_TABS_JS = """<script>
+(function () {
+  var tabs = document.querySelectorAll('.tab'), reloadMs = %s;
+  function show(name, push) {
+    var found = false;
+    tabs.forEach(function (t) {
+      var on = t.dataset.tab === name;
+      found = found || on;
+      t.classList.toggle('on', on);
+      t.setAttribute('aria-selected', on ? 'true' : 'false');
+      document.getElementById('tab-' + t.dataset.tab).classList.toggle('off', !on);
+    });
+    if (!found) { return show('results', push); }
+    if (push) {
+      var url = new URL(location.href);
+      if (name === 'results') { url.searchParams.delete('tab'); }
+      else { url.searchParams.set('tab', name); }
+      // Replace, not push: the tabs are one screen, and making each click a
+      // back-button step would bury the page you arrived from.
+      history.replaceState({tab: name}, '', url);
+    }
+  }
+  tabs.forEach(function (t) {
+    t.addEventListener('click', function () { show(t.dataset.tab, true); });
+  });
+  window.showTab = show;
+  if (reloadMs) {
+    setInterval(function () {
+      var on = document.querySelector('.tab.on');
+      if (on && on.dataset.tab === 'new') { return; }   // do not eat a draft
+      location.reload();
+    }, reloadMs);
+  }
+})();
+</script>"""
 
 
 def _page(title, body, refresh=None):
@@ -610,9 +800,13 @@ def _render_model_cards(cards, history):
     return "\n".join(parts)
 
 
-def render_form(error=None, values=None, models_root=None, presets=None, notice=None,
-                cards=None, history=None):
-    """The submit form: pick a role, write a prompt, tick some models."""
+def form_fragment(error=None, values=None, models_root=None, presets=None,
+                  cards=None, history=None):
+    """The submit form: pick a role, write a prompt, tick some models.
+
+    A fragment, not a page: it is one of the three tabs on the index, so it
+    carries no logo, no page title and no link back to the sessions list.
+    """
     values = values or {}
     presets = presets if presets is not None else presets_mod.load()
     found = models_mod.discover(models_root)
@@ -631,13 +825,9 @@ def render_form(error=None, values=None, models_root=None, presets=None, notice=
     if selected and not values.get("system_prompt"):
         values = dict(values, system_prompt=selected["system_prompt"])
 
-    body = [LOGO_HTML, "<h1>New run</h1>",
-            '<p class="sub">Round 1: every model answers the same prompt. '
+    body = ['<p class="sub">Round 1: every model answers the same prompt. '
             'Round 2 (optional): they judge each other, blind. Round 3 '
-            '(optional): the panel&rsquo;s top pick writes a final synthesis. '
-            '<a href="/">All sessions</a></p>']
-    if notice:
-        body.append('<div class="notice">%s</div>' % html.escape(notice))
+            '(optional): the panel&rsquo;s top pick writes a final synthesis.</p>']
     if error:
         body.append('<div class="err">%s</div>' % html.escape(error))
 
@@ -751,10 +941,11 @@ def render_form(error=None, values=None, models_root=None, presets=None, notice=
 })();
 </script>""")
 
+    # Cancel goes back to the results tab rather than loading a page: nothing
+    # has been submitted, so there is nothing to navigate away from.
     body.append('<div class="actions"><button type="submit">Queue run</button>'
-                '<a class="ghost" href="/" style="text-decoration:none;'
-                'padding:11px 18px;border-radius:8px;border:1px solid var(--border);'
-                'color:var(--series)">Cancel</a></div>')
+                '<button type="button" class="ghost" onclick="showTab('
+                "'results', true)\">Cancel</button></div>")
     body.append("</div></form>")
 
     # The dropdown fills the system prompt and shows what the Prompt box wants.
@@ -811,7 +1002,7 @@ saveBtn.addEventListener('click', function () {
     .then(function (pair) {
       var ok = pair[0], data = pair[1];
       if (!ok) { say(data.error || 'Could not save.', true); return; }
-      location.href = '/new?preset=' + encodeURIComponent(data.id) +
+      location.href = '/?tab=new&preset=' + encodeURIComponent(data.id) +
         '&notice=' + encodeURIComponent('Saved "' + data.title + '".' +
           (data.overwrote_bundled ? ' This replaces the built-in preset of the same name.' : ''));
     })
@@ -829,7 +1020,7 @@ delBtn.addEventListener('click', function () {
     body: new URLSearchParams({id: sel.value})})
     .then(function (r) { return r.json(); })
     .then(function (data) {
-      location.href = '/new?notice=' + encodeURIComponent(
+      location.href = '/?tab=new&notice=' + encodeURIComponent(
         data.reverted ? 'Deleted your edit — the built-in preset is back.' : 'Deleted.');
     })
     .catch(function () { say('Could not reach the server.', true); });
@@ -842,12 +1033,12 @@ resetLink.addEventListener('click', function (e) {
     return;
   }
   fetch('/presets/reset', {method: 'POST'})
-    .then(function () { location.href = '/new?notice=' + encodeURIComponent(
+    .then(function () { location.href = '/?tab=new&notice=' + encodeURIComponent(
       'All custom presets cleared — back to factory defaults.'); })
     .catch(function () { say('Could not reach the server.', true); });
 });
 </script>""")
-    return _page("New run — Roundtable", "\n".join(body))
+    return "\n".join(body)
 
 
 def job_from_form(fields, models_root=None):
@@ -1242,7 +1433,7 @@ def render_job(job_id, root, sp=None):
                     '<a href="/s/%s/report.html">%s</a></p>'
                     % (urllib.parse.quote(name), html.escape(name)))
     body.append('<p class="note"><a href="/">All sessions</a> · '
-                '<a href="/new">Queue another</a></p>')
+                '<a href="/?tab=new">Queue another</a></p>')
     refresh = "3" if state in ("queued", "running") else None
     return _page("%s — Roundtable" % headline, "\n".join(body), refresh), None
 
@@ -1312,11 +1503,8 @@ def make_handler(root, sp=None):
             path = posixpath.normpath(urllib.parse.urlparse(self.path).path)
             if path in ("/", "/index.html"):
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-                return self._send(200, render_index(
-                    root, sp, notice=query.get("notice", [None])[0]))
-            if path == "/new":
-                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 notice = query.get("notice", [None])[0]
+                tab = query.get("tab", [None])[0]
                 selected = query.get("preset", [None])[0]
                 values = {"preset": selected} if selected else None
                 source = query.get("from", [None])[0]
@@ -1325,7 +1513,12 @@ def make_handler(root, sp=None):
                     if values is None:
                         return self._error(404, "No such session.")
                     notice = notice or from_notice
-                return self._send(200, render_form(values=values, notice=notice))
+                # Anything that pre-fills the form is asking for that tab,
+                # whether or not the link that sent us here said so.
+                if values and not tab:
+                    tab = "new"
+                return self._send(200, render_index(root, sp, notice=notice,
+                                                    tab=tab, form_values=values))
             if path == "/health":
                 return self._send(200, json.dumps({"ok": True}),
                                   "application/json; charset=utf-8")
@@ -1333,6 +1526,12 @@ def make_handler(root, sp=None):
                 page, redirect = render_job(path[5:], root, sp)
                 if redirect:
                     return self._send(302, b"", extra={"Location": redirect})
+                return self._send(200, page)
+            if path == "/rejudge":
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                page = render_rejudge(root, query.get("session", [""])[0])
+                if page is None:
+                    return self._error(404, "No such session.")
                 return self._send(200, page)
             if path == "/trash":
                 return self._send(200, render_trash(root))
@@ -1371,6 +1570,8 @@ def make_handler(root, sp=None):
                 return self._do_submit()
             if path == "/rerun":
                 return self._do_rerun()
+            if path == "/rejudge":
+                return self._do_rejudge()
             if path == "/cancel":
                 return self._do_cancel()
             if path == "/cleanup":
@@ -1401,8 +1602,11 @@ def make_handler(root, sp=None):
 
             job, error = job_from_form(fields)
             if error:
-                # Hand the form back with what they typed still in it.
-                return self._send(400, render_form(error=error, values=fields))
+                # Hand the form back with what they typed still in it, on the
+                # tab they typed it into.
+                return self._send(400, render_index(root, sp, tab="new",
+                                                    form_values=fields,
+                                                    form_error=error))
             job_id = spool.submit(job, sp)
             # 303: the browser must follow with GET, not repeat the POST.
             return self._send(303, b"", extra={"Location": "/job/%s"
@@ -1427,6 +1631,38 @@ def make_handler(root, sp=None):
                 return self._error(409, "That session has no prompt to rerun.")
             job["rerun_of"] = name
             job["rerun_from"] = source
+            job_id = spool.submit(job, sp)
+            return self._send(303, b"", extra={"Location": "/job/%s"
+                                               % urllib.parse.quote(job_id)})
+
+        def _do_rejudge(self):
+            """Queue Round 2 again over a finished session, with a new panel."""
+            parsed = self._read_form()
+            if parsed is None:
+                return
+            name = _safe_name((parsed.get("session") or [""])[-1])
+            sdir = os.path.join(root, name) if name else None
+            if not sdir or not os.path.isdir(sdir):
+                return self._error(404, "No such session.")
+            judges = [j for j in parsed.get("judges", []) if j.strip()]
+            if not judges:
+                return self._send(400, render_rejudge(
+                    root, name, error="Pick at least one judge."))
+            data = session_mod.load(sdir)
+            if not data:
+                return self._error(409, "That session has no results to judge.")
+            job = {"judge_only": sdir,
+                   "judges": judges,
+                   "summarize": True,
+                   "meta_summary": bool(parsed.get("meta_summary")),
+                   # Keep the session's own character: a run judged in the open
+                   # must not silently become a blind one on the way back.
+                   "blind": bool(data["blind"]),
+                   # Same seed, so the same panel re-run reads the outputs in
+                   # the same shuffled order both times.
+                   "seed": data["seed"],
+                   "rejudge_of": name,
+                   "sessions_root": root}
             job_id = spool.submit(job, sp)
             return self._send(303, b"", extra={"Location": "/job/%s"
                                                % urllib.parse.quote(job_id)})
