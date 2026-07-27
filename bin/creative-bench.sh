@@ -880,8 +880,16 @@ fi
 # --- SUMMARIZE.md -----------------------------------------------------------
 echo
 echo "→ writing SUMMARIZE.md…"
-SDIR="$SDIR" TEMP="$TEMP" SEED="$SEED" BLIND="${BLIND:-1}" python3 - <<'PYEOF'
-import os, glob
+# The judges, as slugs, so the builder can give each one its own running order
+# with its own entries last. Empty in --no-summarize runs: no judges, one doc.
+JUDGE_SLUGS=""
+if [[ "${SUMMARIZE_ARG:-}" != "0" ]]; then
+  for m in "${UNIQ_MODELS[@]}"; do JUDGE_SLUGS+="${JUDGE_SLUGS:+,}$(slug "$m")"; done
+fi
+export JUDGE_SLUGS
+SDIR="$SDIR" TEMP="$TEMP" SEED="$SEED" BLIND="${BLIND:-1}" \
+  JUDGE_SLUGS="${JUDGE_SLUGS:-}" python3 - <<'PYEOF'
+import os, glob, random
 
 sdir = os.environ["SDIR"]
 files = sorted(f for f in glob.glob(os.path.join(sdir, "*.md"))
@@ -923,108 +931,220 @@ if blind:
 # by judges) and don't clash with the [square brackets] these prompts ask for.
 labels = {rec[0]: "{{%s}}" % chr(65 + i) for i, rec in enumerate(parsed)}
 
-out = [
-    "# Compare these creative-writing runs",
-    "",
-    ("Below are outputs from several local models answering the SAME prompt at the"
-     if blind else
-     "Below are outputs from several local models answering the SAME prompt, some"),
-    ("same temperature and seed. They are anonymised and shuffled: judge the text only."
-     if blind else
-     "with thinking enabled and some without, all at the same temperature and seed."),
-    "",
-    "Judge them on:",
-    "",
-    "1. **Prose quality** — sentence rhythm, imagery, restraint, whether it reads like",
-    "   a human wrote it or like an LLM performing 'good writing'.",
-    "2. **Instruction adherence** — did it actually do what the system + user prompt asked?",
-    "3. **Voice and originality** — distinct point of view, or generic/cliché filler?",
-    "4. **Coherence** — internal consistency, structure, a real ending.",
-    "5. **Repetition** — recycled phrasings, padded paragraphs, looping.",
-    "6. **Sameness** — if two outputs look identical or near-identical, say so",
-    "   explicitly rather than ranking them apart.",
-    "",
-    "Give me: a ranked table (rank, output letter, one-line verdict), then a short",
-    "paragraph per output, then a final recommendation of which output I should",
-    "prefer for this kind of writing — and say plainly if the differences are too",
-    "small to call. Refer to each output ONLY by its tag, copied exactly as",
-    "written, braces included — {{A}}, {{B}} and so on. Never drop the braces.",
-    "",
-    "Finish your reply with one final line in exactly this form, best first, so",
-    "the ranking can be read without parsing your prose:",
-    "",
-    "RANKING: {{A}} > {{B}} > {{C}}",
-    "",
-    "---",
-    "",
-    "## The prompt every model was given",
-    "",
-    "### System prompt",
-    "",
-    "```",
-    rd(os.path.join(sdir, "system-prompt.txt")) or "(none)",
-    "```",
-    "",
-    "### User prompt",
-    "",
-    "```",
-    rd(os.path.join(sdir, "user-prompt.txt")),
-    "```",
-    "",
-    "Shared settings: temperature %s, seed %s (identical across all runs)."
-        % (os.environ["TEMP"], os.environ["SEED"]),
-    "",
-    "---",
-    "",
-    "## Results (%d runs)" % len(files),
-    "",
-]
+def render(records, letters):
+    """One judge's document: the same text, in the order that judge sees it.
 
-for path, meta, body in parsed:
-    mode = "thinking" if meta.get("thinking") == "true" else "no thinking"
-    if blind:
-        # No name, no mode, no tok/s — throughput alone identifies a model.
-        out.append("### Output %s" % labels[path])
-        out.append("")
-    else:
-        out.append("### %s (%s)" % (meta.get("model", os.path.basename(path)), mode))
-        out.append("")
-        out.append("`tokens: %s | tok/s: %s | elapsed: %ss | ctx: %s | error: %s`"
-                   % (meta.get("tokens", "?"), meta.get("tokens_per_sec", "?"),
-                      meta.get("elapsed_sec", "?"), meta.get("context", "?"),
-                      meta.get("error", "null")))
-        out.append("")
-    if blind:
-        # Show ONLY the deliverable. The "## Thinking" section is a dead giveaway:
-        # a no-thinking run prints "(none)" there while a thinking run prints a
-        # 1000-word trace, which re-leaks the mode the blinding just removed.
-        tail = body.split("## Output", 1)
-        out.append((tail[1] if len(tail) > 1 else body).lstrip("\n"))
-    else:
-        # Demote the result file's own "## Thinking"/"## Output" headings so they
-        # don't outrank the "### model" heading they live under.
-        out.append("\n".join(("##" + l) if l.startswith("## ") else l
-                             for l in body.splitlines()))
-    out.append("")
-    out.append("---")
-    out.append("")
+    ``letters`` maps a result file to the tag it carries *in this document*.
+    Tags are assigned by presentation position, so a judge's "{{A}}" is always
+    the entry it read first -- position and tag stay welded together, which is
+    what lets one counterbalanced assignment neutralise both at once.
+    """
+    out = [
+        "# Compare these creative-writing runs",
+        "",
+        ("Below are outputs from several local models answering the SAME prompt at the"
+         if blind else
+         "Below are outputs from several local models answering the SAME prompt, some"),
+        ("same temperature and seed. They are anonymised and shuffled: judge the text only."
+         if blind else
+         "with thinking enabled and some without, all at the same temperature and seed."),
+        "",
+        "Judge them on:",
+        "",
+        "1. **Prose quality** — sentence rhythm, imagery, restraint, whether it reads like",
+        "   a human wrote it or like an LLM performing 'good writing'.",
+        "2. **Instruction adherence** — did it actually do what the system + user prompt asked?",
+        "3. **Voice and originality** — distinct point of view, or generic/cliché filler?",
+        "4. **Coherence** — internal consistency, structure, a real ending.",
+        "5. **Repetition** — recycled phrasings, padded paragraphs, looping.",
+        "6. **Sameness** — if two outputs look identical or near-identical, say so",
+        "   explicitly rather than ranking them apart.",
+        "",
+        "Give me: a ranked table (rank, output letter, one-line verdict), then a short",
+        "paragraph per output, then a final recommendation of which output I should",
+        "prefer for this kind of writing — and say plainly if the differences are too",
+        "small to call. Refer to each output ONLY by its tag, copied exactly as",
+        "written, braces included — {{A}}, {{B}} and so on. Never drop the braces.",
+        "",
+        "Finish your reply with one final line in exactly this form, best first, so",
+        "the ranking can be read without parsing your prose:",
+        "",
+        "RANKING: {{A}} > {{B}} > {{C}}",
+        "",
+        "---",
+        "",
+        "## The prompt every model was given",
+        "",
+        "### System prompt",
+        "",
+        "```",
+        rd(os.path.join(sdir, "system-prompt.txt")) or "(none)",
+        "```",
+        "",
+        "### User prompt",
+        "",
+        "```",
+        rd(os.path.join(sdir, "user-prompt.txt")),
+        "```",
+        "",
+        "Shared settings: temperature %s, seed %s (identical across all runs)."
+            % (os.environ["TEMP"], os.environ["SEED"]),
+        "",
+        "---",
+        "",
+        "## Results (%d runs)" % len(files),
+        "",
+    ]
 
-with open(os.path.join(sdir, "SUMMARIZE.md"), "w") as f:
-    f.write("\n".join(out))
+    for path, meta, body in records:
+        mode = "thinking" if meta.get("thinking") == "true" else "no thinking"
+        if blind:
+            # No name, no mode, no tok/s — throughput alone identifies a model.
+            out.append("### Output %s" % letters[path])
+            out.append("")
+        else:
+            out.append("### %s (%s)" % (meta.get("model", os.path.basename(path)), mode))
+            out.append("")
+            out.append("`tokens: %s | tok/s: %s | elapsed: %ss | ctx: %s | error: %s`"
+                       % (meta.get("tokens", "?"), meta.get("tokens_per_sec", "?"),
+                          meta.get("elapsed_sec", "?"), meta.get("context", "?"),
+                          meta.get("error", "null")))
+            out.append("")
+        if blind:
+            # Show ONLY the deliverable. The "## Thinking" section is a dead giveaway:
+            # a no-thinking run prints "(none)" there while a thinking run prints a
+            # 1000-word trace, which re-leaks the mode the blinding just removed.
+            tail = body.split("## Output", 1)
+            out.append((tail[1] if len(tail) > 1 else body).lstrip("\n"))
+        else:
+            # Demote the result file's own "## Thinking"/"## Output" headings so they
+            # don't outrank the "### model" heading they live under.
+            out.append("\n".join(("##" + l) if l.startswith("## ") else l
+                                 for l in body.splitlines()))
+        out.append("")
+        out.append("---")
+        out.append("")
+    return "\n".join(out)
 
-if blind:
-    key = ["# Key for SUMMARIZE.md", "",
+
+def key_table(records, letters, title, extra=""):
+    key = [title, "",
            "| Output | Model | Mode | tokens | tok/s | elapsed | file |",
            "|---|---|---|---|---|---|---|"]
-    for path, meta, body in sorted(parsed, key=lambda r: labels[r[0]]):
+    for path, meta, body in sorted(records, key=lambda r: letters[r[0]]):
         key.append("| %s | %s | %s | %s | %s | %ss | %s |" % (
-            labels[path], meta.get("model", "?"),
+            letters[path], meta.get("model", "?"),
             "thinking" if meta.get("thinking") == "true" else "no thinking",
             meta.get("tokens", "?"), meta.get("tokens_per_sec", "?"),
             meta.get("elapsed_sec", "?"), os.path.basename(path)))
-    key += ["", "Judges see none of this — they get lettered, shuffled text only."]
+    if extra:
+        key += ["", extra]
+    return "\n".join(key) + "\n"
+
+
+def counterbalance(records, judges, rng):
+    """One presentation order per judge. -> ({judge slug: [record, ...]}, repeats)
+
+    Two rules, in priority order.
+
+    A judge's own entries go LAST. Its vote on itself is discarded by the
+    scorer anyway, so the slot a late position penalises is spent on a vote
+    nobody counts — the penalty is thrown away rather than landing on some
+    other model.
+
+    Everything else is placed so each entry occupies each position AT MOST
+    ONCE across the judges whose votes do count for it. That is the difference
+    between removing the position effect and averaging it down: with six
+    judges, leaving it to chance leaves a lot of imbalance standing. Built by
+    randomised backtracking rather than a fixed rotation, so the running order
+    — and any effect of what an entry is read next to — doesn't repeat session
+    after session.
+
+    ``repeats`` is how many position repeats survived, 0 when the design is
+    exact. It can't always be 0: a judge that ran in both modes owns two
+    entries, which leaves the other judges one fewer slot to spread over.
+    """
+    owner = {r[0]: (r[1].get("model") or "") for r in records}
+    paths = [r[0] for r in records]
+
+    counted_by = {p: [j for j in judges if owner[p] != j] for p in paths}
+    used = {p: set() for p in paths}          # positions this entry has taken
+    design = {}
+
+    def place(idx):
+        if idx == len(judges):
+            return True
+        judge = judges[idx]
+        mine = [p for p in paths if owner[p] == judge]
+        others = [p for p in paths if owner[p] != judge]
+        order = list(others)
+        for _ in range(60):                   # tries for this row, then give up
+            rng.shuffle(order)
+            if any(i + 1 in used[p] for i, p in enumerate(order)):
+                continue
+            for i, p in enumerate(order):
+                used[p].add(i + 1)
+            rng.shuffle(mine)
+            design[judge] = order + mine
+            if place(idx + 1):
+                return True
+            for i, p in enumerate(order):
+                used[p].discard(i + 1)
+            del design[judge]
+        return False
+
+    if not place(0):
+        # No exact design exists (or wasn't found): fall back to plain random
+        # per-judge orders, which still beats one order shared by everyone.
+        design.clear()
+        for judge in judges:
+            mine = [p for p in paths if owner[p] == judge]
+            others = [p for p in paths if owner[p] != judge]
+            rng.shuffle(others); rng.shuffle(mine)
+            design[judge] = others + mine
+
+    repeats = 0
+    for p in paths:
+        seen = [design[j].index(p) for j in counted_by[p]]
+        repeats += len(seen) - len(set(seen))
+
+    by_path = {r[0]: r for r in records}
+    return {j: [by_path[p] for p in order] for j, order in design.items()}, repeats
+
+
+with open(os.path.join(sdir, "SUMMARIZE.md"), "w") as f:
+    f.write(render(parsed, labels))
+
+if blind:
     with open(os.path.join(sdir, "SUMMARIZE-KEY.md"), "w") as f:
-        f.write("\n".join(key) + "\n")
+        f.write(key_table(parsed, labels, "# Key for SUMMARIZE.md",
+                          "Judges see none of this — they get lettered, "
+                          "shuffled text only."))
+
+    # Per-judge documents: same six outputs, a different running order each.
+    judges = [j for j in os.environ.get("JUDGE_SLUGS", "").split(",") if j]
+    if judges:
+        rng = random.Random(int(os.environ["SEED"]) ^ 0x5EED)
+        design, imbalance = counterbalance(parsed, judges, rng)
+        for slug, order in design.items():
+            letters = {rec[0]: "{{%s}}" % chr(65 + i) for i, rec in enumerate(order)}
+            with open(os.path.join(sdir, "SUMMARIZE-%s.md" % slug), "w") as f:
+                f.write(render(order, letters))
+            # Maps this judge's tags onto the canonical ones the report uses.
+            rows = ["# Key for SUMMARIZE-%s.md" % slug, "",
+                    "This judge read the outputs in its own order, so its {{A}} is "
+                    "not the canonical {{A}}.", "",
+                    "| This judge's tag | Canonical | Model | Mode |",
+                    "|---|---|---|---|"]
+            for i, (path, meta, _b) in enumerate(order):
+                rows.append("| {{%s}} | %s | %s | %s |" % (
+                    chr(65 + i), labels[path], meta.get("model", "?"),
+                    "thinking" if meta.get("thinking") == "true" else "no thinking"))
+            with open(os.path.join(sdir, "SUMMARIZE-KEY-%s.md" % slug), "w") as f:
+                f.write("\n".join(rows) + "\n")
+        print("counterbalanced %d judge documents (%s)"
+              % (len(design), "exact" if imbalance == 0 else
+                 "%d position repeat(s)" % imbalance))
 PYEOF
 
 echo "  ✓ wrote SUMMARIZE.md ($(wc -c <"$SDIR/SUMMARIZE.md") bytes)"
@@ -1070,10 +1190,15 @@ if [[ "$RUN_SUMMARY" == "1" && "$OK_RUNS" -gt 0 ]]; then
     STAMP="$(date +%Y%m%d-%H%M%S)"
     echo
     echo "[judge $((j+1))/${#UNIQ_MODELS[@]}] $(name_of "$M")  ($SUMMARY_MODE)"
+    # Its own document if the builder made one — same outputs, its own order,
+    # its own entries last. Falls back to the shared one (older sessions,
+    # re-judging a directory built before per-judge documents existed).
+    JUDGE_DOC="$SDIR/SUMMARIZE-${SLUG}.md"
+    [[ -f "$JUDGE_DOC" ]] || JUDGE_DOC="$SDIR/SUMMARIZE.md"
     if do_run "$M" "$SUMMARY_MODE" \
          "$SDIR/summary_${STAMP}_${SLUG}.md" \
          "$SDIR/logs/summary_${SLUG}.log" \
-         "$SDIR/.summary-system.txt" "$SDIR/SUMMARIZE.md" \
+         "$SDIR/.summary-system.txt" "$JUDGE_DOC" \
          "$SUMMARY_TEMP" "$SUMMARY_MAX_TOKENS"; then
       S_OK=$((S_OK+1))
     else

@@ -73,6 +73,27 @@ def read_key(sdir):
     return key
 
 
+def read_judge_key(sdir, judge):
+    """SUMMARIZE-KEY-<judge>.md -> {this judge's letter: canonical label}.
+
+    Each judge reads the same outputs in its own order, with its own entries
+    last, so its "{{A}}" is whatever it happened to read first -- not the
+    canonical {{A}} the report talks about. This is the translation, and its
+    absence is not an error: sessions judged before per-judge documents existed
+    have one shared order, where the two labellings are the same thing.
+    """
+    text = _read(os.path.join(sdir, "SUMMARIZE-KEY-%s.md" % judge))
+    out = {}
+    for line in text.splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) < 2:
+            continue
+        mine, canonical = cells[0].strip("{}").strip(), cells[1].strip("{}").strip()
+        if re.fullmatch(r"[A-Z]", mine) and re.fullmatch(r"[A-Z]", canonical):
+            out[mine] = canonical
+    return out
+
+
 def _is_result(name):
     return (name.endswith(".md")
             and not name.startswith(("SUMMARIZE", "summary_", "round3_", "README")))
@@ -125,6 +146,9 @@ def read_judges(sdir):
         judges.append({
             "file": name,
             "judge": meta.get("model", judge),
+            # {} when this session had one shared order for everyone.
+            "label_map": read_judge_key(sdir, judge),
+            "ranking_retry": meta.get("ranking_retry") == "true",
             "tokens": _num(meta.get("tokens")),
             "tps": _num(meta.get("tokens_per_sec")),
             "elapsed": _num(meta.get("elapsed_sec")),

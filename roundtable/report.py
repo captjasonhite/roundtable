@@ -454,6 +454,35 @@ def _standings(result):
     return "\n".join(out)
 
 
+def _order_note(rankings):
+    """Say whether the judges read in one order or in counterbalanced ones.
+
+    Worth stating on the page: it is the difference between a session where an
+    entry's position is a fixed advantage for the whole panel, and one where
+    the advantage has been designed out. Sessions judged before 2026-07-26 are
+    the former, and their reports should not imply otherwise.
+    """
+    counted = [r for r in rankings if r.get("positions")]
+    if not counted:
+        return ('<p class="note">All judges read the outputs in the same order, '
+                'so where an entry sat was a fixed advantage or handicap across '
+                'the whole panel.</p>')
+    spread = set()
+    for r in counted:
+        for label, pos in r["positions"].items():
+            spread.add((label, pos))
+    per_label = {}
+    for label, pos in spread:
+        per_label.setdefault(label, set()).add(pos)
+    balanced = all(len(v) >= len(counted) - 1 for v in per_label.values())
+    return ('<p class="note">Each judge read the outputs in its own order, with '
+            'its own entries last &mdash; %s. Position is therefore not an '
+            'advantage any one entry holds.</p>'
+            % ("counterbalanced so each entry sat in a different slot for every "
+               "judge that counted it" if balanced else
+               "shuffled per judge, though not perfectly balanced this time"))
+
+
 def _heatmap(session, result, rankings):
     usable = [r for r in rankings if r["ranks"]]
     if not usable:
@@ -469,6 +498,7 @@ def _heatmap(session, result, rankings):
            'so a tidy left-to-right gradient means the judges agreed; scattered colour marks '
            'a contested output. Rows are the judges &mdash; a judge&rsquo;s own outputs are '
            'outlined in its row.</p>',
+           _order_note(rankings),
            '<div class="card"><table class="heat"><tr><th></th>']
     for label in labels:
         info = session["key"][label]

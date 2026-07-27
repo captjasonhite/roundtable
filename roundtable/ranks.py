@@ -114,16 +114,30 @@ def extract(body, allowed):
 
 
 def extract_all(session):
-    """-> list of {judge, ranks, method, complete} for every judge verdict."""
-    allowed = set(session["key"])
+    """-> list of {judge, ranks, method, complete} for every judge verdict.
+
+    Ranks come back in CANONICAL labels whatever order the judge read in. A
+    judge with its own document wrote its own letters; translating here means
+    nothing downstream -- scoring, the heatmap, the de-anonymiser -- has to know
+    that per-judge orders exist at all.
+    """
+    canonical = set(session["key"])
     out = []
     for judge in session["judges"]:
+        mapping = judge.get("label_map") or {}
+        allowed = set(mapping) if mapping else canonical
         ranks, method, complete = extract(judge["body"], allowed)
+        if mapping:
+            ranks = {mapping[l]: r for l, r in ranks.items() if l in mapping}
+            complete = len(ranks) == len(canonical)
         out.append({
             "judge": judge["judge"],
             "file": judge["file"],
             "ranks": ranks,
             "method": method,
             "complete": complete,
+            # Where this judge read each entry: 1 = first. Same thing as its
+            # own letters, which the builder assigns by position.
+            "positions": {c: ord(l) - 64 for l, c in mapping.items()},
         })
     return out
