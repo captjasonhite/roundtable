@@ -278,6 +278,26 @@ class WorkerLoopTests(unittest.TestCase):
         counts = report._counts(session_mod.load(sdir))
         self.assertEqual(counts[4], counts[5])           # it did run, so it's done
 
+    def test_round_3_is_on_the_count_from_the_first_report(self):
+        """Not just before Round 3 starts -- from the moment the session exists.
+
+        It used to be written only after the bench script exited, so the
+        progress bar and the Judge runs tile grew a seventh unit two rounds in
+        instead of showing '0/1 summary' from the start.
+        """
+        os.environ["STUB_DELAY"] = "1"
+        seen = []
+
+        def watch(session_dir, running):
+            seen.append(session_mod.load(session_dir)["expected_meta"])
+            return render(session_dir, running)
+
+        spool.submit(self.job(id="r3-early"), self.spool)
+        worker.loop(sp=self.spool, runner=STUB, on_report=watch, once=True,
+                    report_every=0.1, log=lambda *a: None)
+        self.assertTrue(seen)
+        self.assertEqual(seen[0], 1)
+
     def test_a_skipped_round_3_is_taken_back_off_the_count(self):
         """Opted out: the report must not sit one run short of complete."""
         os.environ["STUB_DELAY"] = "0"
@@ -329,6 +349,73 @@ class WorkerLoopTests(unittest.TestCase):
             record = json.load(f)
         self.assertTrue(record["session_dir"].startswith(self.sessions + os.sep),
                         record["session_dir"])
+
+    def _finished_session(self, job_id="orig"):
+        """Run a normal job through and hand back its session dir."""
+        os.environ["STUB_DELAY"] = "0"
+        spool.submit(self.job(id=job_id, meta_summary=False), self.spool)
+        worker.loop(sp=self.spool, runner=STUB, on_report=render, once=True,
+                    report_every=0.1, log=lambda *a: None)
+        with open(os.path.join(self.spool, "done", job_id + ".json")) as f:
+            return json.load(f)["session_dir"]
+
+    def test_rejudging_replaces_the_panel_and_keeps_the_outputs(self):
+        sdir = self._finished_session()
+        before = session_mod.load(sdir)
+        self.assertEqual([j["judge"] for j in before["judges"]],
+                         ["stub-alpha-7B-Q4_K_M", "stub-beta-7B-Q4_K_M"])
+
+        spool.submit({"id": "rejudge", "judge_only": sdir,
+                      "judges": ["outsider-13B-Q4_K_M"], "meta_summary": False,
+                      "sessions_root": self.sessions}, self.spool)
+        worker.loop(sp=self.spool, runner=STUB, on_report=render, once=True,
+                    report_every=0.1, log=lambda *a: None)
+
+        after = session_mod.load(sdir)
+        # The new panel, and only the new panel: two panels pooled into one set
+        # of standings is the bug this archiving exists to prevent.
+        self.assertEqual([j["judge"] for j in after["judges"]],
+                         ["outsider-13B-Q4_K_M"])
+        self.assertEqual(after["expected_judges"], 1)
+        # The contest itself is untouched.
+        self.assertEqual([r["model"] for r in after["runs"]],
+                         [r["model"] for r in before["runs"]])
+        self.assertEqual(after["user_prompt"], before["user_prompt"])
+
+    def test_rejudging_keeps_the_old_verdicts_on_disk(self):
+        """Archived, not deleted -- they cost GPU time to produce."""
+        sdir = self._finished_session("orig2")
+        spool.submit({"id": "rejudge2", "judge_only": sdir,
+                      "judges": ["outsider-13B-Q4_K_M"], "meta_summary": False,
+                      "sessions_root": self.sessions}, self.spool)
+        worker.loop(sp=self.spool, runner=STUB, on_report=render, once=True,
+                    report_every=0.1, log=lambda *a: None)
+        archived = os.listdir(os.path.join(sdir, ".judges-1"))
+        self.assertTrue([n for n in archived if n.startswith("summary_")], archived)
+
+    def test_a_second_rejudge_archives_into_its_own_directory(self):
+        sdir = self._finished_session("orig3")
+        for n in (1, 2):
+            spool.submit({"id": "rj%d" % n, "judge_only": sdir,
+                          "judges": ["outsider-13B-Q4_K_M"], "meta_summary": False,
+                          "sessions_root": self.sessions}, self.spool)
+            worker.loop(sp=self.spool, runner=STUB, on_report=render, once=True,
+                        report_every=0.1, log=lambda *a: None)
+        self.assertTrue(os.path.isdir(os.path.join(sdir, ".judges-1")))
+        self.assertTrue(os.path.isdir(os.path.join(sdir, ".judges-2")))
+
+    def test_a_judge_only_job_names_its_session_without_creating_one(self):
+        sdir = self._finished_session("orig4")
+        before = len(os.listdir(self.sessions))
+        spool.submit({"id": "rj-record", "judge_only": sdir,
+                      "judges": ["outsider-13B-Q4_K_M"], "meta_summary": False,
+                      "sessions_root": self.sessions}, self.spool)
+        worker.loop(sp=self.spool, runner=STUB, on_report=render, once=True,
+                    report_every=0.1, log=lambda *a: None)
+        with open(os.path.join(self.spool, "done", "rj-record.json")) as f:
+            record = json.load(f)
+        self.assertEqual(record["session_dir"], sdir)
+        self.assertEqual(len(os.listdir(self.sessions)), before)
 
     def test_two_jobs_run_sequentially(self):
         os.environ["STUB_DELAY"] = "0"

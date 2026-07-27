@@ -10,8 +10,10 @@ While a run is in flight the worker rewrites the session's report every few
 seconds, which is the entire live-progress mechanism: the browser is just
 reloading a file.
 """
+import glob
 import json
 import os
+import shutil
 import signal
 import subprocess
 import time
@@ -85,6 +87,8 @@ def build_command(job, runner=None, prompt_dir=None):
     what the runner's non-interactive interface takes.
     """
     runner = runner or job.get("runner") or DEFAULT_RUNNER
+    if job.get("judge_only"):
+        return _build_judge_command(job, runner)
     prompt_dir = prompt_dir or "."
     sys_path = os.path.join(prompt_dir, "system-prompt.txt")
     usr_path = os.path.join(prompt_dir, "user-prompt.txt")
@@ -119,6 +123,74 @@ def build_command(job, runner=None, prompt_dir=None):
     for key, value in (job.get("env") or {}).items():
         env[str(key)] = str(value)
     return argv, env
+
+
+def _build_judge_command(job, runner):
+    """Round 2 again over a finished session, with a panel of your choosing.
+
+    No prompts and no benchmark: the outputs are already on disk, and
+    ``--summarize-only`` rebuilds the judging documents from them. ``--judges``
+    is what makes this worth doing -- the panel does not have to be the field,
+    so a run of near-relatives can be re-scored by outsiders.
+    """
+    argv = [runner, "--summarize-only", job["judge_only"], "--summarize", "--yes"]
+    judges = job.get("judges") or []
+    if judges:
+        argv += ["--judges", ",".join(judges)]
+    if not job.get("blind", True):
+        argv.append("--no-blind")
+
+    env = dict(os.environ)
+    env["OUTDIR"] = job.get("sessions_root") or DEFAULT_SESSIONS
+    # The judging documents are shuffled per judge from this seed. A re-judge
+    # keeps the session's own seed if the job carries one, so the same panel
+    # re-run twice reads the outputs in the same order both times.
+    if job.get("seed"):
+        env["SEED"] = str(job["seed"])
+    if job.get("summary_temperature"):
+        env["SUMMARY_TEMP"] = str(job["summary_temperature"])
+    for key, value in (job.get("env") or {}).items():
+        env[str(key)] = str(value)
+    return argv, env
+
+
+# What a re-judge supersedes. The output runs, the prompts and the logs stay:
+# only the verdicts about them, and everything computed from those verdicts,
+# belong to the old panel.
+_VERDICT_GLOBS = ("summary_*.md", "round3_*.md", "SUMMARIZE-*.md")
+_VERDICT_KEEP = ("SUMMARIZE-KEY.md",)      # rebuilt in place, not a verdict
+_VERDICT_EXTRAS = ("scores.json", "deanon")
+
+
+def archive_verdicts(session_dir):
+    """Move an existing panel's verdicts aside. -> the archive dir, or None.
+
+    A re-judge writes new ``summary_*.md`` files next to the old ones, and the
+    scorer reads every one it finds -- two panels would silently be pooled into
+    a single set of standings. So the old panel is moved into ``.judges-N/``
+    before the new one runs: out of the scorer's way (it lists the session
+    directory, never its subdirectories) but still on disk, which is the whole
+    reason this is a move and not a delete.
+    """
+    victims = []
+    for pattern in _VERDICT_GLOBS:
+        victims += [p for p in glob.glob(os.path.join(session_dir, pattern))
+                    if os.path.basename(p) not in _VERDICT_KEEP]
+    victims += [p for p in (os.path.join(session_dir, n) for n in _VERDICT_EXTRAS)
+                if os.path.exists(p)]
+    if not victims:
+        return None
+    for n in range(1, 1000):
+        archive = os.path.join(session_dir, ".judges-%d" % n)
+        if not os.path.exists(archive):
+            break
+    os.makedirs(archive, exist_ok=True)
+    for path in victims:
+        try:
+            shutil.move(path, os.path.join(archive, os.path.basename(path)))
+        except OSError:
+            pass                      # a verdict we cannot move is not fatal
+    return archive
 
 
 def build_meta_command(model_slug, system_prompt, user_prompt, session_dir,
@@ -156,6 +228,22 @@ def _expect_meta(session_dir, wanted):
     try:
         spool.write_atomic(os.path.join(session_dir, ".expected-meta"),
                            "1\n" if wanted else "0\n")
+    except OSError:
+        pass
+
+
+def _expect_judges(session_dir, count):
+    """How many judges this pass will produce, before any of them has run.
+
+    The bench script writes this itself once it starts, but a re-judge has
+    just archived the old panel: without this the report would sit at "0 of
+    <the last panel's size>" until the runner got far enough to correct it.
+    """
+    if not count:
+        return
+    try:
+        spool.write_atomic(os.path.join(session_dir, ".expected-judges"),
+                           "%d\n" % count)
     except OSError:
         pass
 
@@ -230,8 +318,22 @@ def run_job(job, running_path, sp=None, runner=None, on_report=None,
     before = _listing(sessions_root)
 
     started = time.time()
-    session_dir = None
+    # A re-judge writes into a session that already exists, so there is no new
+    # directory to watch for: it is known before the runner starts, and the old
+    # panel's verdicts have to be out of the way before the new ones land.
+    session_dir = job.get("judge_only") or None
     with open(log_path, "w", encoding="utf-8") as log:
+        if session_dir:
+            archive = archive_verdicts(session_dir)
+            if archive:
+                log.write("[roundtable] previous verdicts moved to %s\n"
+                          % os.path.basename(archive))
+            _expect_judges(session_dir, len(job.get("judges") or []))
+            _expect_meta(session_dir, job.get("meta_summary", True))
+            # The poll loop below announces the session when it first appears;
+            # this one was never going to appear, so announce it here instead.
+            spool.heartbeat(sp, job=job_id, session=session_dir, state="running")
+            spool.note(running_path, session_dir=session_dir)
         log.write("$ %s\n\n" % " ".join(argv))
         log.flush()
         # Own process group: a stop signal reaches llama-server too, not just
@@ -260,6 +362,12 @@ def run_job(job, running_path, sp=None, runner=None, on_report=None,
                         # a reboot, and whoever reaps this claim afterwards needs
                         # to know which session was left half-written.
                         spool.note(running_path, session_dir=session_dir)
+                        # The moment the session exists, say whether a Round 3
+                        # is coming. Written here rather than after the bench
+                        # script exits so the progress bar and the Judge runs
+                        # tile count the synthesis from the first tick instead
+                        # of growing a seventh unit two rounds in.
+                        _expect_meta(session_dir, job.get("meta_summary", True))
                 if not (session_dir and on_report):
                     continue
 
@@ -302,10 +410,10 @@ def run_job(job, running_path, sp=None, runner=None, on_report=None,
 
     ran_meta_summary = False
     if code == 0 and session_dir:
-        # Round 3 is the worker's step, not the bench script's, so the bench
-        # script can't have counted it. Record it here — between the last judge
-        # finishing and Round 3 starting — or the report shows every run
-        # complete while a model is still loading for the synthesis.
+        # Normally already written when the session dir first appeared; repeated
+        # here for the path where the run was so short the poll loop never saw
+        # it, and because a rerun of an existing session dir starts from
+        # whatever the previous run left behind.
         _expect_meta(session_dir, job.get("meta_summary", True))
         if on_report:
             on_report(session_dir, True)          # Round 1+2 visible while Round 3 loads
