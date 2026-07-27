@@ -8,7 +8,7 @@
 set -euo pipefail
 
 SYS=""; USR=""; TEMP="1.0"; MODE="thinking"; MODELS=""; RUNS="${STUB_RUNS:-2}"
-META_DIR=""; META_MODEL=""; DO_SUMMARIZE=1
+META_DIR=""; META_MODEL=""; DO_SUMMARIZE=1; ONLY_DIR=""; JUDGES=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --system) SYS="$2"; shift 2 ;;
@@ -16,6 +16,8 @@ while [[ $# -gt 0 ]]; do
     --temp)   TEMP="$2"; shift 2 ;;
     --mode)   MODE="$2"; shift 2 ;;
     --models) MODELS="$2"; shift 2 ;;
+    --summarize-only) ONLY_DIR="$2"; shift 2 ;;
+    --judges) JUDGES="$2"; shift 2 ;;
     --meta-summary) META_DIR="$2"; shift 2 ;;
     --meta-model)   META_MODEL="$2"; shift 2 ;;
     --summarize)    DO_SUMMARIZE=1; shift ;;
@@ -54,18 +56,32 @@ EOF
   exit 0
 fi
 
-OUTDIR="${OUTDIR:?stub runner needs OUTDIR}"
 SEED="${SEED:-4242}"
-SDIR="$OUTDIR/$(date +%Y%m%d-%H%M%S)"
-mkdir -p "$SDIR"
-cp "$SYS" "$SDIR/system-prompt.txt" 2>/dev/null || : > "$SDIR/system-prompt.txt"
-cp "$USR" "$SDIR/user-prompt.txt"
-
-IFS=',' read -r -a NAMES <<< "${MODELS:-stub-a-7B-Q4_K_M,stub-b-7B-Q4_K_M}"
 LETTERS=(A B C D E F G H I J)
 
+# Judge-only mode: the outputs are already on disk. Mirrors creative-bench.sh's
+# --summarize-only, including --judges naming a panel that never competed.
+if [[ -n "$ONLY_DIR" ]]; then
+  SDIR="$ONLY_DIR"
+  mapfile -t NAMES < <(grep -h '^model:' "$SDIR"/0[0-9]_*.md |
+                         sed 's/^model: *"\(.*\)"$/\1/')
+  if [[ -n "$JUDGES" ]]; then
+    IFS=',' read -r -a PANEL <<< "$JUDGES"
+  else
+    PANEL=("${NAMES[@]}")
+  fi
+else
+  OUTDIR="${OUTDIR:?stub runner needs OUTDIR}"
+  SDIR="$OUTDIR/$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$SDIR"
+  cp "$SYS" "$SDIR/system-prompt.txt" 2>/dev/null || : > "$SDIR/system-prompt.txt"
+  cp "$USR" "$SDIR/user-prompt.txt"
+  IFS=',' read -r -a NAMES <<< "${MODELS:-stub-a-7B-Q4_K_M,stub-b-7B-Q4_K_M}"
+  PANEL=("${NAMES[@]}")
+fi
+
 n=0
-for m in "${NAMES[@]}"; do
+for m in $([[ -n "$ONLY_DIR" ]] || printf '%s\n' "${NAMES[@]}"); do
   n=$((n+1))
   sleep "${STUB_DELAY:-1}"
   cat > "$SDIR/0${n}_$(date +%Y%m%d-%H%M%S)_${m}_thinking.md" <<EOF
@@ -110,9 +126,10 @@ fi
 } > "$SDIR/SUMMARIZE-KEY.md"
 : > "$SDIR/SUMMARIZE.md"
 
-# Judges: each ranks the outputs, ending with the machine-readable line.
+# Judges: each ranks the outputs, ending with the machine-readable line. The
+# panel is the field unless --judges named someone else.
 i=0
-for m in "${NAMES[@]}"; do
+for m in "${PANEL[@]}"; do
   i=$((i+1))
   sleep "${STUB_DELAY:-1}"
   order=""

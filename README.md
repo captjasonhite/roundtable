@@ -48,6 +48,20 @@ on the page, and reported separately as a self-preference chart, because the siz
 and *sign* of that bias turns out to be one of the more interesting numbers in the
 run.
 
+**3. Who is on the panel.** By default the judges *are* the field — everyone who
+competed also votes. That is fine until the field is a family: four variants of
+one base model and one outsider is four relatives grading their own. **Re-judge**
+on any session queues Round 2 again over the same outputs with a panel you pick,
+which may be models that never competed. Nothing is generated a second time, so
+it costs one model load per judge and answers the only question that matters
+about a suspicious result: does it survive a different jury? On the command line
+that is `--summarize-only DIR --judges "a,b"`.
+
+The previous panel's verdicts move into `.judges-N/` inside the session first,
+so two panels are never pooled into one set of standings. They are kept, not
+deleted — the old scores, the old de-anonymised verdicts and any Round 3
+synthesis built on them all move together.
+
 ## What's in a report
 
 | Section | Round | Question it answers |
@@ -206,6 +220,7 @@ Roundtable reads what `creative-bench.sh` leaves on disk:
     SUMMARIZE-KEY.md                     tag -> model (absent = not blind)
     summary_<stamp>_<model>.md           Round 2: one per judge
     round3_<stamp>_<model>.md            Round 3: the panel's top pick's synthesis
+    .judges-1/                           a superseded panel, moved aside by a re-judge
 ```
 
 Rankings are read from each verdict by three readers, most reliable first:

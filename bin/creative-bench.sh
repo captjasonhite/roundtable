@@ -35,6 +35,16 @@
 #                     SUMMARIZE.md and write its own judgement of all the
 #                     results, saved as summary_<stamp>_<model>.md
 #   --no-summarize    skip that question and stop after SUMMARIZE.md
+#   --judges "a,b"    comma-separated substrings picking WHO judges, instead of
+#                     "everyone who competed". The panel then does not have to
+#                     be drawn from the contestants — which is the point: a
+#                     field of near-relatives judging itself is a field of
+#                     near-relatives grading its own family. Contestants are
+#                     unaffected; this only replaces the Round 2 panel.
+#   --summarize-only DIR
+#                     judge an existing session's results again, skipping the
+#                     benchmark. Combined with --judges, this re-judges a
+#                     finished session with a different panel.
 #   --meta-summary DIR --meta-model PATTERN --system FILE --user FILE
 #                     Round 3: run ONE model (first GGUF path match for
 #                     PATTERN) against the given prompt, appending the result
@@ -225,6 +235,7 @@ SUMMARY_MAX_TOKENS="${SUMMARY_MAX_TOKENS:-16384}"   # not $MAX_TOKENS: on 2026-0
                                    # emitted an EMPTY verdict. Judges need room for think+answer.
 
 SYS_ARG=""; USER_ARG=""; MODELS_ARG=""; MODE_ARG=""; ASSUME_YES=0; SUMMARIZE_ARG=""
+JUDGES_ARG=""
 SUMMARIZE_ONLY_DIR=""
 META_SUMMARY_DIR=""; META_MODEL_ARG=""
 while [[ $# -gt 0 ]]; do
@@ -238,6 +249,7 @@ while [[ $# -gt 0 ]]; do
     --user)   USER_ARG="${2:?--user needs a file}"; shift 2 ;;
     --temp)   TEMP="${2:?--temp needs a number}"; TEMP_USER_SET=1; shift 2 ;;
     --models) MODELS_ARG="${2:?--models needs a list}"; shift 2 ;;
+    --judges) JUDGES_ARG="${2:?--judges needs a list}"; shift 2 ;;
     --mode)   MODE_ARG="${2:?--mode needs a value}"; shift 2 ;;
     --yes|-y) ASSUME_YES=1; shift ;;
     --no-card-settings) CARD_SETTINGS=0; shift ;;
@@ -491,6 +503,32 @@ UNIQ_MODELS=(); for m in "${QUEUE_MODEL[@]}"; do
   seen=0; for u in ${UNIQ_MODELS[@]+"${UNIQ_MODELS[@]}"}; do [[ "$u" == "$m" ]] && seen=1; done
   (( seen )) || UNIQ_MODELS+=("$m")
 done
+
+# ...unless --judges names the panel outright, in which case the judges are
+# whoever it says and need never have competed. Everything downstream -- the
+# expected-judges count, the counterbalanced per-judge documents, pass 2 --
+# reads UNIQ_MODELS, so replacing it here is the whole feature.
+if [[ -n "$JUDGES_ARG" ]]; then
+  UNIQ_MODELS=()
+  IFS=',' read -r -a JUDGE_PATTERNS <<< "$JUDGES_ARG"
+  for pat in "${JUDGE_PATTERNS[@]}"; do
+    pat="$(echo "$pat" | sed 's/^ *//;s/ *$//')"
+    [[ -n "$pat" ]] || continue
+    hit=0
+    for mp in "${ALL_MODELS[@]}"; do
+      if [[ "${mp,,}" == *"${pat,,}"* ]]; then
+        seen=0
+        for u in ${UNIQ_MODELS[@]+"${UNIQ_MODELS[@]}"}; do [[ "$u" == "$mp" ]] && seen=1; done
+        (( seen )) || UNIQ_MODELS+=("$mp")
+        hit=1
+      fi
+    done
+    (( hit )) || { echo "--judges: no model matched '$pat'" >&2; exit 1; }
+  done
+  (( ${#UNIQ_MODELS[@]} )) || { echo "--judges matched nothing" >&2; exit 1; }
+  echo "judges (--judges): ${#UNIQ_MODELS[@]}"
+  for m in "${UNIQ_MODELS[@]}"; do echo "  · $(name_of "$m")"; done
+fi
 
 # How many runs are coming. A run in flight has written no result file yet, so
 # this is the only way the report can say "3 of 6" instead of just "3" — see
