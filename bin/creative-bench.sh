@@ -1001,8 +1001,15 @@ do_run() {
 # helper turns that check on: a run that fails it is told exactly what is
 # missing and asked once more, in the same conversation, off the same loaded
 # model. No scoring penalty; the result records that it needed the second ask.
-# Only pass 1: a judge is not editing anything.
-if [[ -z "$SUMMARIZE_ONLY_DIR" && -z "$META_SUMMARY_DIR" && "${COMPLIANCE:-1}" == "1" ]]; then
+#
+# Gated on the source actually containing a ***CUT*** marker: an ordinary
+# creative-bench prompt (write a story, answer a question) is never asked to
+# reproduce itself, and running this check against one falsely fails every
+# entry -- confirmed against the tool's own smoke-test prompt, which has no
+# marker and no PART 2/3 structure, and was flagged as "0% of the source
+# survives" for a correct answer. Only pass 1: a judge is not editing anything.
+if [[ -z "$SUMMARIZE_ONLY_DIR" && -z "$META_SUMMARY_DIR" && "${COMPLIANCE:-1}" == "1" \
+      && -f "$SDIR/user-prompt.txt" ]] && grep -qF '***CUT***' "$SDIR/user-prompt.txt"; then
   REQUIRE_SOURCE="$SDIR/user-prompt.txt"
 fi
 if [[ -n "$SUMMARIZE_ONLY_DIR" ]]; then

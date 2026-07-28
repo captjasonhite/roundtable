@@ -115,6 +115,20 @@ class ComplianceTests(unittest.TestCase):
         self.assertIsNone(
             compliance.retry_message(compliance.check(SOURCE, faithful(SOURCE))))
 
+    def test_retry_message_does_not_blame_a_marker_the_source_never_had(self):
+        """A plain creative-writing prompt has no ***CUT*** marker and no PART
+        2/3 structure. Naming the marker anyway describes a document shape the
+        model was never asked to produce -- the check should not fire this way
+        at all in the real runner, but if it does, the message must not lie
+        about why."""
+        source = ("Write a short story about a lighthouse keeper who "
+                  "discovers a message in a bottle.")
+        output = "## Output\n\nThe old keeper walked the shore at dawn."
+        f = compliance.check(source, output)
+        self.assertEqual(f["markers"]["source"], 0)
+        msg = compliance.retry_message(f)
+        self.assertNotIn(compliance.MARKER, msg)
+
 
 if __name__ == "__main__":
     unittest.main()

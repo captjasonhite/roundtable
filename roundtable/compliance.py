@@ -214,7 +214,10 @@ def retry_message(findings):
 
     Specific, because the checker knows exactly what is missing, and a vague
     complaint gets a vague correction. Never asks whether it would like to try
-    again: that costs a turn and the answer is always yes.
+    again: that costs a turn and the answer is always yes. The marker line is
+    conditional on the source actually having one -- naming a marker that
+    never appeared in the prompt describes a document structure the model was
+    never asked to produce.
     """
     if not findings.get("faults"):
         return None
@@ -222,10 +225,14 @@ def retry_message(findings):
     for f in findings["faults"]:
         lines.append("- %s" % f["detail"])
     lines.append("")
-    lines.append("Every sentence of the source must appear in PART 2, and every "
-                 "%s marker must stay exactly where it was. Reproduce the "
-                 "complete draft with the missing text restored, keeping your "
-                 "existing additions and their [brackets] unchanged." % MARKER)
+    closing = "Every sentence of the source must appear in PART 2"
+    if findings.get("markers", {}).get("source"):
+        closing += (", and every %s marker must stay exactly where it was"
+                    % MARKER)
+    closing += (". Reproduce the complete draft with the missing text "
+               "restored, keeping your existing additions and their "
+               "[brackets] unchanged.")
+    lines.append(closing)
     return "\n".join(lines)
 
 
