@@ -439,38 +439,6 @@ def _truncation_warning(session, result):
                "its" if len(cut) == 1 else "their"))
 
 
-def _compliance_warning(session):
-    """Entries that broke the brief's checkable rules, and ones that needed asking twice.
-
-    Kept separate from the standings maths on purpose: nothing here changes a
-    score. A panel cannot be relied on to notice that a draft is missing a
-    paragraph -- six judges ranked one fourth while it was short 300 words of
-    the source -- so the page says it instead.
-    """
-    runs = session.get("runs") or []
-    failed = [r for r in runs if r.get("compliance_ok") is False]
-    retried = [r for r in runs if r.get("compliance_retry")]
-    out = []
-    if failed:
-        items = "; ".join(
-            "%s — %s" % (esc(short_model(r["model"], 26)),
-                         esc(r.get("compliance_faults") or "failed the brief"))
-            for r in failed)
-        out.append('<p class="note warn"><b>%d entr%s did not meet the brief</b> '
-                   '— %s. These are mechanical checks, not taste: text that is '
-                   'missing is missing. The standings below are unchanged, '
-                   'because the panel ranked what it was given.</p>'
-                   % (len(failed), "y" if len(failed) == 1 else "ies", items))
-    if retried:
-        out.append('<p class="note">%s %s asked a second time after failing the '
-                   'check, and the corrected draft is what the panel read. No '
-                   'penalty is applied — but a draft that complied first time '
-                   'is not the same result as one that had to be told.</p>'
-                   % (", ".join(esc(short_model(r["model"], 26)) for r in retried),
-                      "was" if len(retried) == 1 else "were"))
-    return "\n".join(out)
-
-
 def _standings(result, session=None):
     rows = [r for r in result["standings"] if r["score"] is not None]
     if not rows:
@@ -478,7 +446,6 @@ def _standings(result, session=None):
     out = ['<p class="eyebrow">Round 2 &middot; blind judging</p>',
            '<h2>Panel standings</h2>',
            _truncation_warning(session, result) if session else "",
-           _compliance_warning(session) if session else "",
            '<p class="note">Mean percentile across judges, self-votes removed '
            '(1.00 = best of the field, 0.00 = worst). Bars share one scale.</p>',
            _too_close(result),

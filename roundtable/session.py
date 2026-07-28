@@ -158,16 +158,6 @@ def read_runs(sdir, key):
                           bool(_num(meta.get("tokens"))
                                and _num(meta.get("tokens")) >= 4096
                                and _num(meta.get("tokens")) % 1024 == 0)),
-            # The brief's checkable demands -- source kept, markers intact,
-            # draft finished. Absent in sessions run before the checker
-            # existed, and in runs whose prompt had nothing to check.
-            "compliance_ok": (meta.get("compliance_ok") == "true"
-                              if "compliance_ok" in meta else None),
-            "compliance_coverage": _num(meta.get("compliance_coverage")),
-            "compliance_faults": meta.get("compliance_faults", ""),
-            # Told what it got wrong and asked once more. Carries no penalty,
-            # but a draft that complied first time is not the same result.
-            "compliance_retry": meta.get("compliance_retry") == "true",
             "body": body,
         })
     return runs

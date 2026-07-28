@@ -217,45 +217,6 @@ class ReportRenderTests(unittest.TestCase):
         self.assertNotIn('href="SUMMARIZE.md"', html)
         self.assertIn('href="SUMMARIZE-KEY.md"', html)
 
-    def test_a_draft_that_broke_the_brief_is_called_out(self):
-        """The panel cannot be relied on to notice: six judges once ranked an
-        entry fourth while it was missing 300 words of the manuscript."""
-        self.write("01_x_alpha_thinking.md",
-                   RUN.replace("error: null",
-                               'error: null\ncompliance_ok: false\n'
-                               'compliance_faults: "81% of the source survives"'))
-        self.write("02_x_beta_thinking.md", RUN_B)
-        self.write("SUMMARIZE-KEY.md", KEY_TWO)
-        self.write("summary_20260101-000000_gamma.md", VERDICT)
-        _, html = self.render()
-        self.assertIn("did not meet the brief", html)
-        self.assertIn("81% of the source survives", html)
-
-    def test_a_retried_draft_is_noted_without_a_penalty(self):
-        self.write("01_x_alpha_thinking.md",
-                   RUN.replace("error: null",
-                               "error: null\ncompliance_ok: true\n"
-                               "compliance_retry: true"))
-        self.write("02_x_beta_thinking.md", RUN_B)
-        self.write("SUMMARIZE-KEY.md", KEY_TWO)
-        self.write("summary_20260101-000000_gamma.md", VERDICT)
-        data, html = self.render()
-        self.assertIn("asked a second time", html)
-        self.assertNotIn("did not meet the brief", html)
-        # The score is untouched -- the note is the whole penalty.
-        result = consensus.score(data, ranks.extract_all(data))
-        self.assertTrue(any(r["score"] is not None for r in result["standings"]))
-
-    def test_a_session_with_no_compliance_data_says_nothing(self):
-        """Every session run before the checker existed."""
-        self.write("01_x_alpha_thinking.md", RUN)
-        self.write("02_x_beta_thinking.md", RUN_B)
-        self.write("SUMMARIZE-KEY.md", KEY_TWO)
-        self.write("summary_20260101-000000_gamma.md", VERDICT)
-        _, html = self.render()
-        self.assertNotIn("did not meet the brief", html)
-        self.assertNotIn("asked a second time", html)
-
     def test_no_output_section_when_no_runs(self):
         self.assertEqual(report._outputs_section({"runs": []}, {"standings": []}), "")
 
