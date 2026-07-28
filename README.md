@@ -85,6 +85,8 @@ roundtable report SESSION                # -> SESSION/report.html
 roundtable report --all ~/bench-results  # every session under a root
 roundtable report SESSION --no-prompts   # leave your prompts out, for sharing
 
+roundtable chain SPEC.json                # run a multi-prompt chain, stage by stage
+
 roundtable submit job.json               # queue a bench run
 roundtable work                          # run queued jobs, one at a time
 roundtable work --drain                  # ...then stop when the queue empties
@@ -104,6 +106,107 @@ in as runs land. A fallback timer covers the gaps and retunes itself after every
 run — about three rebuilds per run, clamped to 5–60 s. A 20-second run polls
 briskly; a five-minute one doesn't rewrite the page thirty times for nothing.
 The first run has nothing to learn from yet, so it starts at 10 s.
+
+## Chains: several prompts in sequence
+
+A chain runs a series of prompts, one panel round each, where each stage's
+winners feed the next stage's prompt as `{{PREVIOUS}}`. It's for pipelines like
+"analyze a manuscript → build an edit plan → execute the edit → QC it → judge
+it publication-ready" — see `examples/manuscript-edit-chain.json` for that one
+worked end to end.
+
+```sh
+roundtable chain SPEC.json               # -> a timestamped dir, one combined report.html
+roundtable chain SPEC.json --root DIR    # write there instead
+```
+
+Two settings are kept separate at every handoff, on purpose:
+
+- **`models`** — the roster: who generates *this* stage's answers. Omit it on
+  a `use_previous: own` stage (below) — the roster there comes from whoever
+  survived the prior stage, not a fresh list.
+- **`use_previous`** — the selection: how much of the *prior* stage's field
+  gets shown to this stage's roster as `{{PREVIOUS}}`:
+  - `all` / `top3` / `top1` — ranked by that stage's own blind judging, and
+    shared: every model on the roster reads the *same* merged, relettered
+    `{{PREVIOUS}}` text (still anonymised, same reasoning as blind judging —
+    a model that recognises another model's prose defers to it rather than
+    reading it). Ten models with `top3` is ten generations conditioned on the
+    same three survivors, not thirty.
+  - `own` — each model that survived the prior stage continues with *only its
+    own* prior output, as its own single-model generation; the results are
+    merged back into one directory and judged together at the end of the
+    stage. This is the one place a chain runs more than one prompt in a
+    stage, and it's still not branching in the sense the rest of the chain
+    avoids: nothing fans out past the roster size, and everything
+    reconverges into one ranking every stage.
+
+  When a stage can't be ranked (a lone model, or `"blind": false`), `all` /
+  `top3` / `top1` quietly fall back to every successful output rather than
+  inventing an order.
+
+`{{MANUSCRIPT}}` is a second placeholder, filled from the spec's top-level
+`"manuscript"` (a file path) or `"manuscript_text"` (inline text — `"manuscript_text"`
+wins if both are given) in every stage that uses it, for source text that
+should stay available across the whole chain, not just the immediately
+preceding stage. The Multi-Prompt tab's Manuscript box is a paste-in textarea
+and always sends `"manuscript_text"`.
+
+A stage can also opt into `"meta_summary": true` — the same Round 3 synthesis
+a plain session gets (`digest.py`): once that stage has a scored panel, its
+own top-ranked model writes a short synthesis explaining the verdict. Useful
+on the last stage, so a chain ends with prose, not just a ranked table.
+
+Each generate+judge stage is written under `<root>/<NN>-<name>/`, holding an
+ordinary session directory with its own `report.html` (an `own` stage's
+merged directory sits one level deeper, under a timestamp, since several
+single-model runs land there). Live progress within a stage is the same as a
+plain session's: `report.html` rebuilds as each result lands, self-refreshing
+until the stage finishes — chains reuse the exact same polling loop
+(`worker.run_and_poll`), so a stage in flight looks and behaves like a normal
+running job. `should_stop`/cancelling reaches a stage already in progress the
+same way, killing its subprocess rather than waiting for it to finish.
+`<root>/chain.json` records the roster and selection at every handoff,
+updated after every stage rather than only at the end; `<root>/report.html`
+is the chain's own report -- every stage rendered with the exact same
+sections a plain session's report gets (tiles, standings, verdicts, the
+Round 3 synthesis if a stage asked for one), one stack after another in run
+order, so a chain reads as more rounds of the same report rather than a
+different kind of page. It self-refreshes while the chain is still running,
+same as a plain session's does.
+
+### The Multi-Prompt tab
+
+`roundtable serve` / `roundtable up` has a **Multi-Prompt** tab alongside
+Results, New run and Queue — fields and checkboxes, not JSON. The model
+roster is picked once, at the top of the form (the same checklist as the New
+run tab, plus a manuscript textarea to paste a story into) — not per stage.
+Below that, one card per stage holds its own system prompt and prompt
+textarea, a "start from a template" dropdown that fills a stage from the
+manuscript-editing workflow this tab shipped with (editable afterwards —
+overwrite any field to write your own instead), and a checkbox for a final
+synthesis. "+ Add stage" clones a blank card; "Remove this stage" drops one.
+
+The first stage runs the chosen roster; every stage after that automatically
+has each of those models continue *its own* previous answer (`use_previous:
+"own"` — see above). That's deliberately the only wiring the tab offers today
+— per-stage rosters, or a shared top-3/top-1 handoff between stages, are real
+things to want and the chain engine already supports them (see the JSON
+fields above), just not from this form yet. Reach for `roundtable chain
+SPEC.json` with a hand-written spec — or edit one, like
+`examples/manuscript-edit-chain.json` — for those combinations in the
+meantime.
+
+Queuing a chain runs it through the same worker and queue as everything else,
+so it never runs at the same time as a single-prompt job (still one model in
+VRAM at a time). Cancelling a chain from the Queue tab takes effect between
+stages, not mid-stage — a stage already running always finishes or fails on
+its own first.
+
+A chain spec is still plain JSON underneath (see above) — the CLI
+(`roundtable chain SPEC.json`) and `examples/manuscript-edit-chain.json` use
+that form directly, and it's what the tab's fields get assembled into on
+submit.
 
 ## The queue
 

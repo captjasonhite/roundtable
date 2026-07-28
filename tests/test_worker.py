@@ -459,6 +459,31 @@ class WorkerLoopTests(unittest.TestCase):
         self.assertEqual(record["session_dir"], sdir)
         self.assertEqual(len(os.listdir(self.sessions)), before)
 
+    def test_a_chain_job_runs_through_the_normal_queue(self):
+        os.environ["STUB_DELAY"] = "0"
+        spec = {
+            "stages": [
+                {"name": "one", "models": ["stub-a-7B"],
+                 "system_prompt": "sys", "user_prompt": "go"},
+                {"name": "two", "models": ["stub-b-7B"], "use_previous": "top1",
+                 "system_prompt": "sys", "user_prompt": "{{PREVIOUS}}"},
+            ]
+        }
+        spool.submit({"id": "chain1", "chain_spec": spec, "chain_name": "test",
+                     "sessions_root": self.sessions}, self.spool)
+        ran = worker.loop(sp=self.spool, runner=STUB, on_report=render,
+                          once=True, report_every=0.1, log=lambda *a: None)
+        self.assertEqual(ran, 1)
+
+        with open(os.path.join(self.spool, "done", "chain1.json")) as f:
+            record = json.load(f)
+        self.assertEqual(record["state"], "done")
+        self.assertEqual(record["stages"], 2)
+        root = record["session_dir"]
+        self.assertTrue(os.path.isdir(root))
+        self.assertTrue(os.path.exists(os.path.join(root, "chain.json")))
+        self.assertTrue(os.path.exists(os.path.join(root, "report.html")))
+
     def test_two_jobs_run_sequentially(self):
         os.environ["STUB_DELAY"] = "0"
         spool.submit(self.job(id="first"), self.spool)

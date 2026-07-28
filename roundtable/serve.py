@@ -14,12 +14,13 @@ import json
 import mimetypes
 import os
 import posixpath
+import re
 import shutil
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import benchmarks, consensus, ranks
+from . import benchmarks, chain as chain_mod, consensus, ranks
 from . import models as models_mod
 from . import model_cards as model_cards_mod
 from . import presets as presets_mod
@@ -189,11 +190,46 @@ def _resolve(root, rel):
     return target
 
 
+def _report_is_live(path, files):
+    if "report.html" not in files:
+        return False
+    try:
+        with open(os.path.join(path, "report.html"), encoding="utf-8") as f:
+            return 'http-equiv="refresh"' in f.read(4000)
+    except OSError:
+        return False
+
+
+def _chain_session_row(path, name, files):
+    """A chain directory, in the same row shape ``list_sessions`` yields for
+    a plain session -- chain.json + report.html is the same "session" shape
+    with more rounds inside it, so it belongs in the same list rather than a
+    separate one. -> row dict, or None if chain.json can't be read.
+    """
+    try:
+        with open(os.path.join(path, "chain.json"), encoding="utf-8") as f:
+            manifest = json.load(f)
+    except (OSError, ValueError):
+        return None
+    stages = manifest.get("stages", [])
+    planned = manifest.get("planned") or [s["name"] for s in stages]
+    return {
+        "name": name, "path": path, "report": "report.html" in files,
+        "runs": len(stages), "stage_total": len(planned),
+        "judges": sum(1 for s in stages if s.get("scored")),
+        "live": _report_is_live(path, files), "chain": True,
+        "mtime": os.path.getmtime(os.path.join(path, "chain.json")),
+    }
+
+
 def list_sessions(root):
-    """-> [{name, path, report, runs, judges, live, mtime}] newest first."""
+    """-> [{name, path, report, runs, judges, live, mtime, chain}] newest
+    first. Chain runs are included here too (``chain: True``), not only in
+    a separate listing -- see ``_chain_session_row``.
+    """
     out = []
     try:
-        names = sorted(os.listdir(root), reverse=True)
+        names = os.listdir(root)
     except OSError:
         return out
     for name in names:
@@ -206,26 +242,57 @@ def list_sessions(root):
             files = os.listdir(path)
         except OSError:
             continue
+        if "chain.json" in files:
+            row = _chain_session_row(path, name, files)
+            if row:
+                out.append(row)
+            continue
         # session._is_result, not a looser filter of its own: it also excludes
         # round3_*.md, which is the synthesis, not a seventh output run. The row
         # said "7 runs" next to a report saying "6/6" until this was shared.
         results = [f for f in files if session_mod._is_result(f)]
         if not results:
             continue
-        has_report = "report.html" in files
-        live = False
-        if has_report:
-            try:
-                with open(os.path.join(path, "report.html"), encoding="utf-8") as f:
-                    live = 'http-equiv="refresh"' in f.read(4000)
-            except OSError:
-                pass
         out.append({
-            "name": name, "path": path, "report": has_report,
+            "name": name, "path": path, "report": "report.html" in files,
             "runs": len(results),
             "judges": len([f for f in files if f.startswith("summary_")]),
-            "live": live,
+            "live": _report_is_live(path, files), "chain": False,
             "mtime": os.path.getmtime(path),
+        })
+    out.sort(key=lambda r: r["mtime"], reverse=True)
+    return out
+
+
+def list_chains(root):
+    """-> [{name, path, stages, total, scored, stopped, mtime}] newest first.
+
+    A chain writes its own manifest (chain.json) after every stage, so this
+    is read straight off disk rather than recomputed -- the same "reports are
+    static files" rule everything else here follows.
+    """
+    out = []
+    try:
+        names = sorted(os.listdir(root), reverse=True)
+    except OSError:
+        return out
+    for name in names:
+        path = os.path.join(root, name)
+        manifest_path = os.path.join(path, "chain.json")
+        if not (name.startswith("chain-") and os.path.isfile(manifest_path)):
+            continue
+        try:
+            with open(manifest_path, encoding="utf-8") as f:
+                manifest = json.load(f)
+        except (OSError, ValueError):
+            continue
+        out.append({
+            "name": name, "path": path,
+            "stages": [s["name"] for s in manifest.get("stages", [])],
+            "scored": sum(1 for s in manifest.get("stages", []) if s.get("scored")),
+            "stopped": bool(manifest.get("stopped")),
+            "finished": bool(manifest.get("finished")),
+            "mtime": os.path.getmtime(manifest_path),
         })
     return out
 
@@ -450,10 +517,11 @@ def render_trash(root):
 
 
 def render_index(root, sp=None, notice=None, tab=None, form_values=None,
-                 form_error=None, models_root=None):
-    """The whole app in three tabs: Results, New run, Queue.
+                 form_error=None, models_root=None, chain_error=None,
+                 chain_values=None):
+    """The whole app in four tabs: Results, New run, Multi-Prompt, Queue.
 
-    One page, three panels, rendered together and switched client-side. The
+    One page, four panels, rendered together and switched client-side. The
     form is not a separate page any more: queuing a run is the main thing this
     app does, and it used to cost a navigation away from the results.
     """
@@ -461,6 +529,7 @@ def render_index(root, sp=None, notice=None, tab=None, form_values=None,
     beat = spool.read_heartbeat(sp) or {}
     rows = list_sessions(root)
     jobs = active_jobs(sp)
+    chains = list_chains(root)
     # A session is live because a worker says so, never because the last report
     # written into it happens to carry a refresh tag -- that tag outlives the
     # run that wrote it, and a session killed mid-run keeps it forever.
@@ -476,7 +545,7 @@ def render_index(root, sp=None, notice=None, tab=None, form_values=None,
     # seconds forever is exactly the symptom of the bug this repairs.
     reloading = any(r["live"] for r in rows) or any(not j["stale"] for j in jobs)
 
-    tab = tab if tab in ("results", "new", "queue") else "results"
+    tab = tab if tab in ("results", "new", "chain", "queue") else "results"
 
     parts = ['<!doctype html><html lang="en"><head><meta charset="utf-8">',
              '<meta name="viewport" content="width=device-width,initial-scale=1">']
@@ -510,6 +579,7 @@ def render_index(root, sp=None, notice=None, tab=None, form_values=None,
     parts.append('<nav class="tabs" role="tablist">')
     for key, label, count in (("results", "Results", len(rows)),
                               ("new", "New run", None),
+                              ("chain", "Multi-Prompt", len(chains) or None),
                               ("queue", "Queue", waiting)):
         parts.append('<button type="button" class="tab%s" role="tab" '
                      'data-tab="%s" aria-selected="%s">%s%s</button>'
@@ -536,44 +606,61 @@ def render_index(root, sp=None, notice=None, tab=None, form_values=None,
                 pill = ('<span class="pill stale" title="This run stopped part '
                         'way through — its report was last written mid-run">'
                         'stopped</span>')
+            elif r["chain"]:
+                pill = '<span class="pill">%d/%d stages</span>' % (r["runs"], r["stage_total"])
             else:
                 pill = '<span class="pill">%d judges</span>' % r["judges"]
             name = urllib.parse.quote(r["name"])
-            # Same settings is a POST: it queues a run. Prompts only is a plain
-            # link -- it just opens the form, nothing happens until you submit.
-            acts = ('<span class="acts">'
-                    '<form method="post" action="/rerun">'
-                    '<input type="hidden" name="session" value="%s">'
-                    '<button type="submit" title="Queue this exact run again — '
-                    'same prompts, same models, same settings">Rerun</button>'
-                    '</form>'
-                    '<a class="go" href="/?tab=new&amp;from=%s" title="Open the form with '
-                    'these prompts filled in, so you can change the models and '
-                    'settings before running">Rerun prompts only</a>'
-                    # No outputs are regenerated, so this is cheap next to a
-                    # rerun -- and it is the only way to ask whether the
-                    # standings hold up under a panel that isn't the field.
-                    '<a class="go" href="/rejudge?session=%s" title="Judge these '
-                    'same outputs again with a panel you choose">Re-judge</a>'
-                    # A POST, not a link: this acts on the first click, and a
-                    # prefetcher following a GET must never be able to bin a
-                    # session. The undo is the trash folder, not a confirm step.
-                    '<form method="post" action="/delete">'
-                    '<input type="hidden" name="session" value="%s">'
-                    '<button type="submit" class="del" title="Move this session '
-                    'to the trash folder">Remove</button></form>%s</span>'
-                    % (html.escape(r["name"]), name, name, html.escape(r["name"]),
-                       # Rewrites the report without the reload tag, so a run
-                       # that died stops pretending it is still going.
-                       ('<a href="/rebuild/%s" title="Rewrite this report as a '
-                        'finished one, so it stops reloading itself">Settle'
-                        '</a>' % name) if r["stalled"] else ""))
+            if r["chain"]:
+                # A chain has no single system-prompt.txt/user-prompt.txt at its
+                # root to rerun or rejudge from -- each stage has its own, one
+                # click into the report. Only removal applies here.
+                acts = ('<span class="acts">'
+                        '<form method="post" action="/delete">'
+                        '<input type="hidden" name="session" value="%s">'
+                        '<button type="submit" class="del" title="Move this chain '
+                        'to the trash folder">Remove</button></form></span>'
+                        % html.escape(r["name"]))
+                meta = "%d/%d stages · %s" % (r["runs"], r["stage_total"],
+                                             time.strftime("%Y-%m-%d %H:%M",
+                                                           time.localtime(r["mtime"])))
+            else:
+                # Same settings is a POST: it queues a run. Prompts only is a
+                # plain link -- it just opens the form, nothing happens until
+                # you submit.
+                acts = ('<span class="acts">'
+                        '<form method="post" action="/rerun">'
+                        '<input type="hidden" name="session" value="%s">'
+                        '<button type="submit" title="Queue this exact run again — '
+                        'same prompts, same models, same settings">Rerun</button>'
+                        '</form>'
+                        '<a class="go" href="/?tab=new&amp;from=%s" title="Open the form with '
+                        'these prompts filled in, so you can change the models and '
+                        'settings before running">Rerun prompts only</a>'
+                        # No outputs are regenerated, so this is cheap next to a
+                        # rerun -- and it is the only way to ask whether the
+                        # standings hold up under a panel that isn't the field.
+                        '<a class="go" href="/rejudge?session=%s" title="Judge these '
+                        'same outputs again with a panel you choose">Re-judge</a>'
+                        # A POST, not a link: this acts on the first click, and a
+                        # prefetcher following a GET must never be able to bin a
+                        # session. The undo is the trash folder, not a confirm step.
+                        '<form method="post" action="/delete">'
+                        '<input type="hidden" name="session" value="%s">'
+                        '<button type="submit" class="del" title="Move this session '
+                        'to the trash folder">Remove</button></form>%s</span>'
+                        % (html.escape(r["name"]), name, name, html.escape(r["name"]),
+                           # Rewrites the report without the reload tag, so a run
+                           # that died stops pretending it is still going.
+                           ('<a href="/rebuild/%s" title="Rewrite this report as a '
+                            'finished one, so it stops reloading itself">Settle'
+                            '</a>' % name) if r["stalled"] else ""))
+                meta = "%d runs · %s" % (r["runs"],
+                                        time.strftime("%Y-%m-%d %H:%M",
+                                                      time.localtime(r["mtime"])))
             parts.append('<div class="row"><a href="%s">%s</a>%s'
-                         '<span class="meta">%d runs · %s</span>%s</div>'
-                         % (link, html.escape(r["name"]), pill, r["runs"],
-                            time.strftime("%Y-%m-%d %H:%M",
-                                          time.localtime(r["mtime"])),
-                            acts))
+                         '<span class="meta">%s</span>%s</div>'
+                         % (link, html.escape(r["name"]), pill, meta, acts))
         parts.append("</div>")
 
     if binned:
@@ -592,6 +679,17 @@ def render_index(root, sp=None, notice=None, tab=None, form_values=None,
     parts.append(form_fragment(error=form_error, values=form_values,
                                models_root=models_root))
     parts.append("</div>")                                     # /tab-new
+
+    parts.append('<div class="panel%s" id="tab-chain" role="tabpanel">'
+                 % ("" if tab == "chain" else " off"))
+    cv = chain_values or {}
+    parts.append(chain_fragment(error=chain_error, stage_values=cv.get("stages"),
+                                chain_name=cv.get("chain_name"),
+                                manuscript=cv.get("manuscript"),
+                                models_root=models_root,
+                                think_on=cv.get("think_on"), think_off=cv.get("think_off"),
+                                extra_models=cv.get("extra_models")))
+    parts.append("</div>")                                     # /tab-chain
 
     parts.append('<div class="panel%s" id="tab-queue" role="tabpanel">'
                  % ("" if tab == "queue" else " off"))
@@ -647,7 +745,8 @@ _TABS_JS = """<script>
   if (reloadMs) {
     setInterval(function () {
       var on = document.querySelector('.tab.on');
-      if (on && on.dataset.tab === 'new') { return; }   // do not eat a draft
+      // do not eat a draft -- neither tab's textarea should vanish mid-edit.
+      if (on && (on.dataset.tab === 'new' || on.dataset.tab === 'chain')) { return; }
       location.reload();
     }, reloadMs);
   }
@@ -869,36 +968,9 @@ def form_fragment(error=None, values=None, models_root=None, presets=None,
     # Models -- each row picks the model AND its thinking mode at once: check
     # "on", "off", or both (= two runs). Checking neither excludes the model.
     body.append('<div class="field"><label>Models</label>')
-    if not found:
-        body.append('<p class="hint">No .gguf files found under <code>%s</code>. '
-                    'Set <code>ROUNDTABLE_MODELS</code>, or list patterns below.</p>'
-                    % html.escape(models_root or models_mod.DEFAULT_ROOT))
-    else:
-        on_default = set(values.get("think_on") or [])
-        off_default = set(values.get("think_off") or [])
-        has_defaults = bool(on_default or off_default)
-        body.append('<div class="checks models">'
-                    '<div class="check head"><span>Run w/o Think</span>'
-                    '<span>Run w/ Think</span><span>Model</span><span>Size</span>'
-                    '</div>')
-        for m in found:
-            if has_defaults:
-                on, off = m["name"] in on_default, m["name"] in off_default
-            else:
-                off = models_mod.thinking_off_by_default(m["name"])
-                on = not off
-            body.append(
-                '<label class="check"><input type="checkbox" name="think_off" '
-                'value="%s"%s><input type="checkbox" name="think_on" value="%s"%s>'
-                '<code>%s</code><span class="sz">%.1f GB</span></label>'
-                % (html.escape(m["name"]), " checked" if off else "",
-                   html.escape(m["name"]), " checked" if on else "",
-                   html.escape(m["name"]), m["size_gb"]))
-        body.append("</div>")
-        body.append('<p class="hint">%s Defaults follow past results: thinking '
-                    'off for models that scored better that way, on otherwise. '
-                    'Check both boxes for a model to run it twice.</p>'
-                    % html.escape(models_mod.sizes_note(found)))
+    body.append(_model_checks_html(found, "think_on", "think_off",
+                                   values.get("think_on"), values.get("think_off"),
+                                   models_root))
     body.append('</div>')
 
     body.append('<div class="field"><label for="extra_models">Extra model '
@@ -1041,6 +1113,368 @@ resetLink.addEventListener('click', function (e) {
     return "\n".join(body)
 
 
+# The five prompts from the manuscript-editing workflow this tab was built
+# for -- also in examples/manuscript-edit-chain.json as a plain chain spec.
+# "Start from a template" fills a stage's fields from one of these; nothing
+# forces a stage to keep them, and typing over a field is the "or write your
+# own" half of that button.
+STAGE_TEMPLATES = [
+    {"key": "analyze", "label": "Analyze", "meta_summary": False,
+     "system_prompt": "You are an expert Developmental Editor specializing in "
+                      "Romance and Erotica fiction. You excel at mapping narrative "
+                      "structure, heat progression, emotional-physical anchoring, "
+                      "and sensory layering.",
+     "user_prompt": "Analyze the provided manuscript through the lens of the "
+                    "Fichtean Curve (escalating crises leading directly to climax). "
+                    "Deliver a concise, actionable diagnostic report. No rewriting.\n\n"
+                    "1. Fichtean Alignment: initial spark, whether rising action is "
+                    "true escalating complications, where stakes plateau.\n"
+                    "2. Heat & Emotional Curve: physical escalation against "
+                    "emotional progression; note mismatches.\n"
+                    "3. POV & Transitions: head-hopping, timeline jumps, weak "
+                    "transitions.\n"
+                    "4. Sensory Layering Audit: scenes lacking multi-sensory detail "
+                    "during intimate beats.\n"
+                    "5. One Critical Intervention: the single section needing a "
+                    "complication, heat escalation, or emotional anchor before "
+                    "the climax.\n\n**THE STORY TO EDIT:**\n{{MANUSCRIPT}}"},
+    {"key": "plan", "label": "Editorial Plan", "meta_summary": False,
+     "system_prompt": "You are an Executive Editor translating developmental "
+                      "diagnostics into a precise, executable edit roadmap.",
+     "user_prompt": "Convert the diagnostic below into a section-by-section "
+                    "editorial plan. Prioritize high-impact structural changes, "
+                    "heat pacing targets, and voice preservation rules. No rewriting.\n\n"
+                    "1. Section-by-Section Beat Adjustments: Fichtean function, heat "
+                    "target, emotional anchor, sensory priority per scene.\n"
+                    "2. Priority Matrix: Critical / High / Low.\n"
+                    "3. Bracketing & Voice Protocol.\n"
+                    "4. Heat Escalation Targets per section.\n\n"
+                    "**THE STORY TO EDIT:**\n{{MANUSCRIPT}}\n\n"
+                    "**DIAGNOSTIC:**\n{{PREVIOUS}}"},
+    {"key": "rewrite", "label": "Rewrite", "meta_summary": False,
+     "system_prompt": "You are a Senior Developmental Editor executing a precise, "
+                      "structure-first integration pass for Romance/Erotica fiction.",
+     "user_prompt": "Rewrite the full manuscript by applying the editorial plan "
+                    "below. Preserve the client's voice, escalate tension using the "
+                    "Fichtean Curve, layer sensory/emotional beats, and bracket all "
+                    "significant structural additions with [square brackets].\n\n"
+                    "1. Preserve voice — do not alter sentences unless they break "
+                    "grammar or stall pacing.\n2. Each scene raises stakes "
+                    "immediately.\n3. Weave in sensory/emotional layering where the "
+                    "plan specifies.\n4. [Bracket] every addition.\n5. Follow the "
+                    "heat escalation targets exactly.\n\n"
+                    "**THE STORY TO EDIT:**\n{{MANUSCRIPT}}\n\n"
+                    "**EDITORIAL PLAN:**\n{{PREVIOUS}}"},
+    {"key": "qc", "label": "Consistency / QC", "meta_summary": False,
+     "system_prompt": "You are a Developmental Editor + Line Editor hybrid "
+                      "auditing an edited manuscript against its editorial plan.",
+     "user_prompt": "Review the integrated draft below for structural consistency, "
+                    "voice drift, heat pacing adherence, sensory layering, bracket "
+                    "cleanliness, and unresolved tension. Flag issues and recommend "
+                    "targeted fixes. No rewriting, report only.\n\n"
+                    "**ORIGINAL MANUSCRIPT:**\n{{MANUSCRIPT}}\n\n"
+                    "**INTEGRATED EDITOR'S DRAFT:**\n{{PREVIOUS}}"},
+    {"key": "judge", "label": "Judge", "meta_summary": True,
+     "system_prompt": "You are an Acquisitions Editor & Final Gatekeeper "
+                      "evaluating a romance/erotica manuscript for publication "
+                      "readiness.",
+     "user_prompt": "Apply a weighted rubric to each QC report and its underlying "
+                    "draft, and give a final verdict per candidate.\n\n"
+                    "1. Fichtean Structural Integrity (25%)\n"
+                    "2. Heat & Emotional Pacing (20%)\n3. Voice Preservation (15%)\n"
+                    "4. Sensory Immersion (15%)\n5. Climax Payoff (15%)\n"
+                    "6. Readiness for Publication (10%)\n\n"
+                    "State GREENLIGHT / YELLOW LIGHT / RED LIGHT, and list the top "
+                    "3 micro-fixes that would push a YELLOW to GREEN.\n\n"
+                    "**ORIGINAL MANUSCRIPT:**\n{{MANUSCRIPT}}\n\n"
+                    "**QC REPORTS (one per candidate draft):**\n{{PREVIOUS}}"},
+]
+
+
+def _stage_defaults():
+    """The starter set of stages a fresh Multi-Prompt tab loads with --
+    the workflow the tab was designed around, ready to queue as-is or edit."""
+    return [{"name": t["label"], "system_prompt": t["system_prompt"],
+            "user_prompt": t["user_prompt"], "meta_summary": t["meta_summary"]}
+           for t in STAGE_TEMPLATES]
+
+
+def _stage_block_html(idx, values, first):
+    """One stage's fields, under names namespaced ``stage_<idx>_*`` so a
+    posted form can be regrouped by stage regardless of add/remove order.
+
+    No per-stage models or "carry forward" picker: the roster is chosen once,
+    at the top of the form, for the whole chain, and every stage after the
+    first automatically continues each of those models' own previous answer
+    (``use_previous: "own"``). Picking a different subset, or a shared
+    top-N handoff, per stage is a real thing to want later -- not built yet.
+    """
+    v = values or {}
+
+    def val(key, default=""):
+        return html.escape(str(v.get(key, default)))
+
+    tpl_opts = "".join('<option value="%s">%s</option>' % (t["key"], html.escape(t["label"]))
+                       for t in STAGE_TEMPLATES)
+
+    parts = ['<div class="card stage" data-idx="%d">' % idx]
+    parts.append('<div class="grid">')
+    parts.append('<div class="field"><label>Stage name</label>'
+                '<input type="text" name="stage_%d_name" value="%s" '
+                'placeholder="e.g. Analyze"></div>' % (idx, val("name")))
+    parts.append('<div class="field"><label>Start from a template</label>'
+                '<select class="stage-template-pick" data-idx="%d">'
+                '<option value="">— pick one —</option>%s</select>'
+                '<p class="hint">Fills this stage&rsquo;s fields below. Everything '
+                'stays editable afterwards — write your own instead, or on top of '
+                'it.</p></div>' % (idx, tpl_opts))
+    parts.append('</div>')
+
+    parts.append('<div class="field"><label>System prompt</label>'
+                '<textarea name="stage_%d_system_prompt" rows="4" '
+                'placeholder="Who the model should be for this stage.">%s'
+                '</textarea></div>' % (idx, val("system_prompt")))
+    parts.append('<div class="field"><label>Prompt</label>'
+                '<textarea name="stage_%d_user_prompt" rows="8" '
+                'placeholder="The task for this stage. Use {{MANUSCRIPT}} for the '
+                'shared source text%s.">%s</textarea>%s</div>'
+                % (idx, "" if first else " and {{PREVIOUS}} for what this model "
+                                        "wrote last stage",
+                   val("user_prompt"),
+                   '' if first else '<p class="hint">Each model here works from '
+                                    'its own previous answer.</p>'))
+
+    parts.append('<div class="field"><label class="check">'
+                '<input type="checkbox" name="stage_%d_meta_summary" value="1"%s> '
+                'Have the top-ranked result write a final summary</label>'
+                '<p class="hint">Usually only checked on the last stage.</p></div>'
+                % (idx, " checked" if v.get("meta_summary") else ""))
+
+    parts.append('<div class="actions"><button type="button" class="ghost '
+                'remove-stage">Remove this stage</button></div>')
+    parts.append('</div>')                                     # /card.stage
+    return "\n".join(parts)
+
+
+def chain_fragment(error=None, stage_values=None,
+                   chain_name=None, manuscript=None, models_root=None,
+                   think_on=None, think_off=None, extra_models=None):
+    """The Multi-Prompt tab: run several prompts in sequence -- fields and
+    checkboxes, not a JSON blob, the same shape as the single-prompt New run
+    form repeated per stage.
+
+    The model roster is picked once, at the top, for the whole chain: every
+    stage after the first automatically has each of those models continue
+    its own previous answer. Per-stage rosters or a shared top-N handoff are
+    a real thing to want later; not built into this form yet (see
+    ``roundtable chain`` / a hand-written spec for that in the meantime).
+    """
+    stage_values = stage_values if stage_values is not None else _stage_defaults()
+    found = models_mod.discover(models_root)
+
+    body = ['<p class="sub">Run several prompts in sequence. Pick your models '
+            'once below — every stage after the first has each of them continue '
+            'its own previous answer.</p>']
+    if error:
+        body.append('<div class="err">%s</div>' % html.escape(error))
+
+    body.append('<form method="post" action="/chain/submit"><div class="card">')
+    body.append('<div class="field"><label for="chain_name">Name</label>'
+                '<input type="text" id="chain_name" name="chain_name" value="%s" '
+                'placeholder="e.g. my-story"><p class="hint">Names the output '
+                'folder; not shown to the models.</p></div>'
+                % html.escape(chain_name or ""))
+    body.append('<div class="field"><label for="chain_manuscript">Manuscript</label>'
+                '<textarea id="chain_manuscript" name="chain_manuscript" rows="14" '
+                'placeholder="Paste your story here.">%s</textarea>'
+                '<p class="hint">Fills <code>{{MANUSCRIPT}}</code> in every stage '
+                'below that uses it. Optional — leave blank if no stage needs it.</p>'
+                '</div>' % html.escape(manuscript or ""))
+    body.append('<div class="field"><label>Models</label>')
+    body.append(_model_checks_html(found, "chain_think_on", "chain_think_off",
+                                   think_on, think_off, models_root))
+    body.append('</div>')
+    body.append('<div class="field"><label>Extra model patterns</label>'
+                '<input type="text" name="chain_extra_models" value="%s" '
+                'placeholder="comma-separated substrings"></div>'
+                % html.escape(extra_models or ""))
+    body.append('</div>')                                      # /card
+
+    body.append('<div id="stages">')
+    for idx, values in enumerate(stage_values):
+        body.append(_stage_block_html(idx, values, idx == 0))
+    body.append('</div>')                                      # /stages
+
+    next_idx = len(stage_values)
+    body.append('<div class="actions"><button type="button" id="add_stage">'
+                '+ Add stage</button></div>')
+    body.append('<template id="stage-template">%s</template>'
+               % _stage_block_html(0, {}, False).replace(
+                   'data-idx="0"', 'data-idx="__IDX__"').replace(
+                   'name="stage_0_', 'name="stage___IDX___').replace(
+                   'stage_%d_' % 0, 'stage___IDX___'))
+
+    body.append('<div class="actions"><button type="submit">'
+                'Queue chain</button>'
+                '<button type="button" class="ghost" onclick="showTab('
+                "'results', true)\">Cancel</button></div>")
+    body.append("</form>")
+
+    body.append("<script>\nvar STAGE_TEMPLATES = %s;\nvar nextStageIdx = %d;\n"
+               % (json.dumps({t["key"]: t for t in STAGE_TEMPLATES}), next_idx))
+    body.append("""
+(function () {
+  var stages = document.getElementById('stages');
+  var tpl = document.getElementById('stage-template');
+  var addBtn = document.getElementById('add_stage');
+
+  function wire(block) {
+    var idx = block.dataset.idx;
+    var removeBtn = block.querySelector('.remove-stage');
+    removeBtn.addEventListener('click', function () {
+      if (stages.querySelectorAll('.stage').length <= 1) {
+        alert('A chain needs at least one stage.'); return;
+      }
+      block.remove();
+    });
+    var pick = block.querySelector('.stage-template-pick');
+    pick.addEventListener('change', function () {
+      var t = STAGE_TEMPLATES[pick.value];
+      pick.value = '';
+      if (!t) { return; }
+      block.querySelector('[name="stage_' + idx + '_name"]').value = t.label;
+      block.querySelector('[name="stage_' + idx + '_system_prompt"]').value = t.system_prompt;
+      block.querySelector('[name="stage_' + idx + '_user_prompt"]').value = t.user_prompt;
+      block.querySelector('[name="stage_' + idx + '_meta_summary"]').checked = !!t.meta_summary;
+    });
+  }
+
+  Array.prototype.forEach.call(stages.querySelectorAll('.stage'), wire);
+
+  addBtn.addEventListener('click', function () {
+    var idx = nextStageIdx++;
+    var html = tpl.innerHTML.split('__IDX__').join(idx);
+    var holder = document.createElement('div');
+    holder.innerHTML = html;
+    var block = holder.firstElementChild;
+    stages.appendChild(block);
+    wire(block);
+  });
+})();
+</script>""")
+
+    # Past chains are not re-listed here -- they show up in the ordinary
+    # Results list (list_sessions includes them), same as every plain
+    # session; this tab is only for starting a new one.
+    body.append('<p class="note"><a href="/">&larr; See finished runs, chains '
+               "included, on the Results tab.</a></p>")
+
+    return "\n".join(body)
+
+
+def _models_from_checks(on, off, extra=""):
+    """Checked model names + a mode each, plus freeform patterns. -> [pattern,...]
+
+    Shared by the single-prompt form and each Multi-Prompt stage: a model in
+    both the "on" and "off" lists runs twice (``:both``); freeform patterns
+    from the extra-patterns field run with thinking on, since they have no
+    per-model checkboxes of their own.
+    """
+    on, off = {m for m in on if m.strip()}, {m for m in off if m.strip()}
+    checked = []
+    for name in sorted(on | off):
+        if name in on and name in off:
+            checked.append("%s:both" % name)
+        elif name in on:
+            checked.append("%s:thinking" % name)
+        else:
+            checked.append("%s:nothinking" % name)
+    extras = [p.strip() for p in (extra or "").split(",") if p.strip()]
+    return checked + [p for p in extras if p not in on and p not in off]
+
+
+def _model_checks_html(found, name_on, name_off, on_default=None, off_default=None,
+                       models_root=None):
+    """The two-checkbox-per-model grid (thinking on/off), as its own fragment.
+
+    Factored out of the single-prompt form so a Multi-Prompt stage can embed
+    the identical picker under its own field names -- one call per stage,
+    each with a distinct ``name_on``/``name_off`` so the checked boxes land
+    back under the right stage on submit.
+    """
+    if not found:
+        return ('<p class="hint">No .gguf files found under <code>%s</code>. '
+                'Set <code>ROUNDTABLE_MODELS</code>, or list patterns below.</p>'
+                % html.escape(models_root or models_mod.DEFAULT_ROOT))
+    on_default = set(on_default or ())
+    off_default = set(off_default or ())
+    has_defaults = bool(on_default or off_default)
+    parts = ['<div class="checks models">'
+            '<div class="check head"><span>Run w/o Think</span>'
+            '<span>Run w/ Think</span><span>Model</span><span>Size</span></div>']
+    for m in found:
+        if has_defaults:
+            on, off = m["name"] in on_default, m["name"] in off_default
+        else:
+            off = models_mod.thinking_off_by_default(m["name"])
+            on = not off
+        parts.append(
+            '<label class="check"><input type="checkbox" name="%s" '
+            'value="%s"%s><input type="checkbox" name="%s" value="%s"%s>'
+            '<code>%s</code><span class="sz">%.1f GB</span></label>'
+            % (html.escape(name_off), html.escape(m["name"]), " checked" if off else "",
+               html.escape(name_on), html.escape(m["name"]), " checked" if on else "",
+               html.escape(m["name"]), m["size_gb"]))
+    parts.append("</div>")
+    parts.append('<p class="hint">%s Defaults follow past results: thinking off '
+                'for models that scored better that way, on otherwise. Check both '
+                'boxes for a model to run it twice.</p>' % html.escape(models_mod.sizes_note(found)))
+    return "\n".join(parts)
+
+
+_STAGE_FIELD_RE = re.compile(
+    r"^stage_(\d+)_(name|system_prompt|user_prompt|meta_summary)$")
+
+
+def _stages_from_form(parsed):
+    """A posted Multi-Prompt form -> (stage_values, spec_stages).
+
+    ``parsed`` is ``parse_qs()``-style (every value a list). Stages are
+    grouped by the index in their field names (``stage_<i>_...``), not by
+    position in the form, so adding and removing stage blocks client-side
+    needs no renumbering. ``stage_values`` is what redraws the form (kept on
+    a validation failure); ``spec_stages`` is what goes into the chain spec.
+
+    There is one roster for the whole chain (see ``chain_think_on`` etc. in
+    ``_do_chain_submit``), not one per stage: the first stage in index order
+    gets it as ``models``; every later stage gets ``use_previous: "own"`` and
+    no ``models`` of its own, so each of those models continues its own
+    previous answer.
+    """
+    matches = [_STAGE_FIELD_RE.match(k) for k in parsed]
+    indices = sorted({int(m.group(1)) for m in matches if m})
+    stage_values, spec_stages = [], []
+    for pos, i in enumerate(indices):
+        def get(field, default=""):
+            return (parsed.get("stage_%d_%s" % (i, field)) or [default])[-1]
+        meta_summary = bool(get("meta_summary"))
+        name = get("name").strip()
+        system_prompt = get("system_prompt")
+        user_prompt = get("user_prompt")
+
+        stage_values.append({"name": name, "system_prompt": system_prompt,
+                            "user_prompt": user_prompt, "meta_summary": meta_summary})
+
+        stage = {"name": name or "stage-%d" % (pos + 1), "system_prompt": system_prompt,
+                "user_prompt": user_prompt}
+        if meta_summary:
+            stage["meta_summary"] = True
+        if pos > 0:
+            stage["use_previous"] = "own"
+        spec_stages.append(stage)
+    return stage_values, spec_stages
+
+
 def job_from_form(fields, models_root=None):
     """Form fields -> (job dict, error).
 
@@ -1051,27 +1485,11 @@ def job_from_form(fields, models_root=None):
     if not user_prompt:
         return None, "A prompt is required — that is what the models answer."
 
-    # Each checkbox model line carries its own mode: on, off, or both if the
-    # user ticked both boxes. A model in neither list is simply not running.
-    on = {m for m in fields.get("think_on", []) if m.strip()}
-    off = {m for m in fields.get("think_off", []) if m.strip()}
-    checked = []
-    for name in sorted(on | off):
-        if name in on and name in off:
-            checked.append("%s:both" % name)
-        elif name in on:
-            checked.append("%s:thinking" % name)
-        else:
-            checked.append("%s:nothinking" % name)
-
     mode = fields.get("mode", "thinking")
     if mode not in ("thinking", "nothinking", "both"):
         return None, "Thinking must be on, off, or both."
-    # Freeform patterns have no per-model checkboxes, so they use the mode
-    # select above instead of carrying their own ":mode" suffix.
-    extra = [p.strip() for p in (fields.get("extra_models") or "").split(",")
-             if p.strip()]
-    patterns = checked + [p for p in extra if p not in on and p not in off]
+    patterns = _models_from_checks(fields.get("think_on", []), fields.get("think_off", []),
+                                   fields.get("extra_models") or "")
     if not patterns:
         return None, "Pick at least one model, or give a pattern to match."
 
@@ -1329,11 +1747,13 @@ def active_jobs(sp=None):
             "session": (job.get("session_dir")
                         or (beat.get("session") if not stale else None)),
             "models": len(job.get("models") or []),
+            "chain": bool(job.get("chain_spec")),
         })
     for _, job in spool.jobs("queue", sp):
         out.append({"id": job.get("id", ""), "state": "queued", "stale": False,
                     "created": job.get("created", ""), "session": None,
-                    "models": len(job.get("models") or [])})
+                    "models": len(job.get("models") or []),
+                    "chain": bool(job.get("chain_spec"))})
     return out
 
 
@@ -1429,9 +1849,10 @@ def render_job(job_id, root, sp=None):
                "Clear this job" if state == "stopped" else "Cancel this run"))
     if session_dir:
         name = os.path.basename(session_dir.rstrip("/"))
-        body.append('<p class="note">Results so far: '
-                    '<a href="/s/%s/report.html">%s</a></p>'
-                    % (urllib.parse.quote(name), html.escape(name)))
+        if os.path.exists(os.path.join(root, name, "report.html")):
+            body.append('<p class="note">Results so far: '
+                        '<a href="/s/%s/report.html">%s</a></p>'
+                        % (urllib.parse.quote(name), html.escape(name)))
     body.append('<p class="note"><a href="/">All sessions</a> · '
                 '<a href="/?tab=new">Queue another</a></p>')
     refresh = "3" if state in ("queued", "running") else None
@@ -1568,6 +1989,8 @@ def make_handler(root, sp=None):
             path = posixpath.normpath(urllib.parse.urlparse(self.path).path)
             if path == "/submit":
                 return self._do_submit()
+            if path == "/chain/submit":
+                return self._do_chain_submit()
             if path == "/rerun":
                 return self._do_rerun()
             if path == "/rejudge":
@@ -1609,6 +2032,47 @@ def make_handler(root, sp=None):
                                                     form_error=error))
             job_id = spool.submit(job, sp)
             # 303: the browser must follow with GET, not repeat the POST.
+            return self._send(303, b"", extra={"Location": "/job/%s"
+                                               % urllib.parse.quote(job_id)})
+
+        def _do_chain_submit(self):
+            parsed = self._read_form()
+            if parsed is None:
+                return
+            chain_name = (parsed.get("chain_name") or [""])[-1].strip()
+            manuscript = (parsed.get("chain_manuscript") or [""])[-1].strip()
+            think_on = [m for m in parsed.get("chain_think_on", []) if m.strip()]
+            think_off = [m for m in parsed.get("chain_think_off", []) if m.strip()]
+            extra_models = (parsed.get("chain_extra_models") or [""])[-1]
+            stage_values, spec_stages = _stages_from_form(parsed)
+            values = {"chain_name": chain_name, "manuscript": manuscript,
+                     "stages": stage_values, "think_on": think_on,
+                     "think_off": think_off, "extra_models": extra_models}
+
+            def fail(message):
+                return self._send(400, render_index(
+                    root, sp, tab="chain", chain_values=values, chain_error=message))
+
+            models = _models_from_checks(think_on, think_off, extra_models)
+            if not models:
+                return fail("Pick at least one model, or give a pattern to match.")
+            if spec_stages:
+                spec_stages[0]["models"] = models
+
+            spec = {"stages": spec_stages}
+            if manuscript:
+                spec["manuscript_text"] = manuscript
+            try:
+                chain_mod.validate_spec(spec)
+            except ValueError as exc:
+                return fail(str(exc))
+            for stage in spec_stages:
+                if not stage.get("user_prompt", "").strip():
+                    return fail("Stage %r needs a prompt." % stage.get("name", "?"))
+
+            job = {"chain_spec": spec, "chain_name": _safe_name(chain_name) or "chain",
+                  "sessions_root": root}
+            job_id = spool.submit(job, sp)
             return self._send(303, b"", extra={"Location": "/job/%s"
                                                % urllib.parse.quote(job_id)})
 

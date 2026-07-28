@@ -702,6 +702,98 @@ class LiveServerTests(unittest.TestCase):
         self.assertEqual(status, 404)
 
 
+class ChainTabTests(unittest.TestCase):
+    """The Multi-Prompt tab: a fourth panel, and the /chain/submit route."""
+
+    setUp = LiveServerTests.setUp
+    tearDown = LiveServerTests.tearDown
+    get = LiveServerTests.get
+
+    def test_index_carries_the_multi_prompt_tab(self):
+        status, body, _ = self.get("/")
+        self.assertEqual(status, 200)
+        self.assertIn('data-tab="chain"', body)
+        self.assertIn('id="tab-chain"', body)
+        self.assertIn('action="/chain/submit"', body)
+        # Fields, not a JSON blob: one prompt box per stage, one roster for
+        # the whole chain (not per stage).
+        self.assertIn('name="stage_0_system_prompt"', body)
+        self.assertIn('name="stage_0_user_prompt"', body)
+        self.assertIn('name="chain_think_on"', body)
+        self.assertNotIn('name="stage_0_think_on"', body)
+        self.assertNotIn('name="stage_0_use_previous"', body)
+        self.assertIn('id="add_stage"', body)
+        # Loads with the five-stage workflow already filled in, not blank.
+        self.assertIn("Fichtean Curve", body)
+
+    def _stage_fields(self, i, **over):
+        fields = {"stage_%d_name" % i: "one", "stage_%d_system_prompt" % i: "sys",
+                 "stage_%d_user_prompt" % i: "go"}
+        for k, v in over.items():
+            fields["stage_%d_%s" % (i, k)] = v
+        return fields
+
+    def _chain_fields(self, **over):
+        fields = dict(self._stage_fields(0), chain_think_on="stub-a-7B")
+        fields.update(over)
+        return fields
+
+    def test_a_stage_with_no_prompt_is_rejected_with_the_form_kept(self):
+        body_fields = self._chain_fields()
+        body_fields["stage_0_user_prompt"] = ""
+        status, body, _ = self.get(
+            "/chain/submit", method="POST",
+            body=urllib.parse.urlencode(body_fields, doseq=True))
+        self.assertEqual(status, 400)
+        self.assertIn("needs a prompt", body)
+        self.assertIn(">sys</textarea>", body)         # draft is kept, not lost
+
+    def test_no_models_is_rejected(self):
+        status, body, _ = self.get(
+            "/chain/submit", method="POST",
+            body=urllib.parse.urlencode(self._stage_fields(0), doseq=True))
+        self.assertEqual(status, 400)
+        self.assertIn("Pick at least one model", body)
+
+    def test_a_valid_form_is_queued_and_redirects_to_the_job_page(self):
+        body_fields = dict(self._chain_fields(), chain_name="my-story")
+        status, _, headers = self.get(
+            "/chain/submit", method="POST",
+            body=urllib.parse.urlencode(body_fields, doseq=True))
+        self.assertEqual(status, 303)
+        self.assertTrue(headers["Location"].startswith("/job/"))
+        self.assertEqual(spool.counts(self.spool)["queue"], 1)
+
+    def test_pasted_manuscript_text_is_carried_as_inline_text_not_a_path(self):
+        body_fields = dict(self._chain_fields(), chain_name="my-story",
+                          chain_manuscript="Once upon a time.")
+        status, _, headers = self.get(
+            "/chain/submit", method="POST",
+            body=urllib.parse.urlencode(body_fields, doseq=True))
+        self.assertEqual(status, 303)
+        _, job = spool.jobs("queue", self.spool)[0]
+        self.assertEqual(job["chain_spec"]["manuscript_text"], "Once upon a time.")
+        self.assertNotIn("manuscript", job["chain_spec"])
+
+    def test_one_roster_lands_on_the_first_stage_and_later_stages_go_own(self):
+        fields = {}
+        fields.update(self._stage_fields(0, name="first"))
+        fields.update(self._stage_fields(3, name="second"))
+        fields["chain_name"] = "multi"
+        fields["chain_think_on"] = "stub-a-7B"
+        status, _, headers = self.get(
+            "/chain/submit", method="POST",
+            body=urllib.parse.urlencode(fields, doseq=True))
+        self.assertEqual(status, 303)
+        _, job = spool.jobs("queue", self.spool)[0]
+        stages = job["chain_spec"]["stages"]
+        self.assertEqual([s["name"] for s in stages], ["first", "second"])
+        self.assertEqual(stages[0]["models"], ["stub-a-7B:thinking"])
+        self.assertNotIn("use_previous", stages[0])
+        self.assertEqual(stages[1]["use_previous"], "own")
+        self.assertNotIn("models", stages[1])
+
+
 class PresetRouteTests(unittest.TestCase):
     """The preset save/delete/reset routes, over real HTTP.
 

@@ -1,0 +1,41 @@
+{
+  "manuscript": "manuscript.txt",
+  "stages": [
+    {
+      "name": "analyze",
+      "models": ["Qwen3.6-27B:thinking", "Gemma4-26B:thinking"],
+      "mode": "thinking",
+      "system_prompt": "You are an expert Developmental Editor specializing in Romance and Erotica fiction. You excel at mapping narrative structure, heat progression, emotional-physical anchoring, and sensory layering.",
+      "user_prompt": "# Task\nAnalyze the provided manuscript through the lens of the Fichtean Curve (escalating crises leading directly to climax). Deliver a concise, actionable diagnostic report. No rewriting.\n\n# Analysis Requirements\n1. Fichtean Alignment: Identify the initial spark, assess whether rising action feels like true escalating complications (not linear build), and flag where stakes plateau.\n2. Heat & Emotional Curve: Map physical escalation against emotional progression. Note mismatches (e.g., high heat with low emotional anchor, or vice versa).\n3. POV & Transitions: Identify scene transitions. Flag head-hopping, timeline jumps, or transitions that weaken tension.\n4. Sensory Layering Audit: Identify scenes lacking multi-sensory detail (smell, sound, temperature, taste) during intimate beats.\n5. One Critical Intervention: Name the single section where a complication, heat escalation, or emotional anchor must be raised before the climax.\n\n# Output Format\nPART 1: STRUCTURAL DIAGNOSTIC\nPART 2: HEAT & EMOTIONAL CURVE MAP\nPART 3: TENSION & POV AUDIT\nPART 4: ONE CRITICAL INTERVENTION\n\n**THE STORY TO EDIT:**\n{{MANUSCRIPT}}"
+    },
+    {
+      "name": "editorial-plan",
+      "models": ["Qwen3.6-27B:thinking", "Gemma4-26B:thinking"],
+      "mode": "thinking",
+      "use_previous": "top1",
+      "system_prompt": "You are an Executive Editor translating developmental diagnostics into a precise, executable edit roadmap.",
+      "user_prompt": "# Task\nConvert the diagnostic below into a section-by-section editorial plan that will guide the next editing pass. Prioritize high-impact structural changes, heat pacing targets, and voice preservation rules. No rewriting.\n\n# Plan Requirements\n1. Section-by-Section Beat Adjustments: for each scene, Fichtean function (complication/deepening/climax anchor), heat target, emotional anchor, sensory priority.\n2. Priority Matrix: Critical / High / Low, only insert what moves the curve forward.\n3. Bracketing & Voice Protocol: when brackets are used, structural addition vs minor grammar, matching the client's rhythm.\n4. Heat Escalation Targets: how physical intensity should progress per section.\n\n# Output Format\nPART 1: SECTION-BY-SECTION EDIT MAP\nPART 2: PRIORITY MATRIX\nPART 3: BRACKETING & VOICE PROTOCOL\nPART 4: HEAT ESCALATION TARGETS\n\n**THE STORY TO EDIT:**\n{{MANUSCRIPT}}\n\n**PART 1: STRUCTURAL DIAGNOSTIC + HEAT CURVE MAP + CRITICAL INTERVENTION:**\n{{PREVIOUS}}"
+    },
+    {
+      "name": "rewrite",
+      "use_previous": "own",
+      "system_prompt": "You are a Senior Developmental Editor executing a precise, structure-first integration pass for Romance/Erotica fiction.",
+      "user_prompt": "# Task\nRewrite the full manuscript by applying the editorial plan below. Preserve the client's voice, escalate tension using the Fichtean Curve, layer sensory/emotional beats, and bracket all significant structural additions with [square brackets].\n\n# Execution Rules\n1. Preserve voice: do not alter existing sentences unless they break grammar or actively stall pacing.\n2. Apply Fichtean escalation: each scene introduces a new complication, desire shift, or obstacle that raises stakes immediately.\n3. Sensory & emotional layering: weave in smell, temperature, sound, or hesitation where the plan specifies.\n4. Bracket strategy: [square brackets] for all additions.\n5. Heat pacing: follow the escalation targets exactly.\n\n# Output Format\nINTEGRATED EDITOR'S DRAFT\n\n**THE STORY TO EDIT:**\n{{MANUSCRIPT}}\n\n**PART 1-4: EDITORIAL PLAN:**\n{{PREVIOUS}}"
+    },
+    {
+      "name": "qc",
+      "use_previous": "own",
+      "system_prompt": "You are a Developmental Editor + Line Editor hybrid auditing an edited manuscript against its editorial plan.",
+      "user_prompt": "# Task\nReview the integrated draft below for structural consistency, voice drift, heat pacing adherence, sensory layering, bracket cleanliness, and unresolved tension. Flag issues and recommend targeted fixes. No rewriting, report only.\n\n# Output Format\nQC REPORT: STRUCTURAL & VOICE AUDIT\nPACING & HEAT CONSISTENCY\nVOICE & BRACKET CLEANLINESS\nONE TARGETED FIX\n\n**ORIGINAL MANUSCRIPT:**\n{{MANUSCRIPT}}\n\n**INTEGRATED EDITOR'S DRAFT (with QC audit target):**\n{{PREVIOUS}}"
+    },
+    {
+      "name": "judge",
+      "models": ["Qwen3.6-27B:thinking", "Gemma4-26B:thinking"],
+      "mode": "thinking",
+      "use_previous": "all",
+      "meta_summary": true,
+      "system_prompt": "You are an Acquisitions Editor & Final Gatekeeper evaluating a romance/erotica manuscript for publication readiness.",
+      "user_prompt": "# Task\nApply the rubric below to each QC report and its underlying draft, and give a final verdict per candidate.\n\n# Rubric Dimensions (Score 1-5 each)\n1. Fichtean Structural Integrity (25%)\n2. Heat & Emotional Pacing (20%)\n3. Voice Preservation (15%)\n4. Sensory Immersion (15%)\n5. Climax Payoff (15%)\n6. Readiness for Publication (10%)\n\n# Output Format\nJUDGMENT RUBRIC\nWEIGHTED SCORE & VERDICT (GREENLIGHT / YELLOW LIGHT / RED LIGHT)\nTOP 3 MICRO-FIXES\nFINAL NOTE TO CLIENT\n\n**ORIGINAL MANUSCRIPT:**\n{{MANUSCRIPT}}\n\n**QC REPORTS (one per candidate draft):**\n{{PREVIOUS}}"
+    }
+  ]
+}

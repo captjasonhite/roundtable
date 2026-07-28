@@ -3,6 +3,7 @@
 
     roundtable report SESSION [SESSION...]     render sessions as HTML
     roundtable report --all [ROOT]             render every session under ROOT
+    roundtable chain SPEC.json                 run a multi-prompt chain, stage by stage
     roundtable submit JOB.json                 put a job in the queue
     roundtable work                            run queued jobs, one at a time
     roundtable up                              serve the form + run the worker (the app)
@@ -19,12 +20,13 @@ import argparse
 import json
 import os
 import sys
+import time
 
 # realpath, not abspath: this is meant to be symlinked onto PATH.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
-from roundtable import benchmarks, consensus, ranks, report, session as session_mod
-from roundtable import serve, spool, worker
+from roundtable import benchmarks, chain as chain_mod, consensus, ranks, report
+from roundtable import serve, session as session_mod, spool, worker
 
 DEFAULT_ROOT = os.environ.get(
     "ROUNDTABLE_SESSIONS", os.path.expanduser("~/Apps/creative-bench"))
@@ -85,6 +87,17 @@ def cmd_report(args):
     if not args.quiet:
         print("%d report(s) written" % written)
     return 0 if written else 1
+
+
+def cmd_chain(args):
+    spec = chain_mod.load_spec(args.spec)
+    root = args.root or spec.get("root")
+    if not root:
+        base = os.path.splitext(os.path.basename(args.spec))[0]
+        root = os.path.join(DEFAULT_ROOT,
+                            "chain-%s-%s" % (base, time.strftime("%Y%m%d-%H%M%S")))
+    chain_mod.run_chain(spec, root, runner=args.runner)
+    return 0
 
 
 def cmd_submit(args):
@@ -235,6 +248,14 @@ def main(argv=None):
                    help="leave the system/user prompt out of the report, for sharing")
     r.add_argument("-q", "--quiet", action="store_true")
     r.set_defaults(func=cmd_report)
+
+    ch = subs.add_parser("chain", help="run a multi-prompt chain, stage by stage")
+    ch.add_argument("spec", help="path to a chain spec JSON")
+    ch.add_argument("--root", help="output directory for the chain's stage sessions "
+                                   "(default: a timestamped dir under %s)" % DEFAULT_ROOT)
+    ch.add_argument("--runner", help="bench script to shell out to (default %s)"
+                                     % worker.DEFAULT_RUNNER)
+    ch.set_defaults(func=cmd_chain)
 
     s = subs.add_parser("submit", help="put a job in the queue")
     s.add_argument("job", help="path to a session.json")

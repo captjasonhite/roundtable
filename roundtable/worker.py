@@ -18,6 +18,7 @@ import signal
 import subprocess
 import time
 
+from . import chain as chain_mod
 from . import consensus, digest, ranks, session as session_mod, spool
 
 _BUNDLED_RUNNER = os.path.join(
@@ -291,6 +292,163 @@ def run_meta_summary(job, session_dir, sp=None, runner=None, log=None):
     return code == 0
 
 
+def run_chain_job(job, running_path, sp=None, runner=None, on_report=None,
+                  report_every=REPORT_EVERY, should_stop=None,
+                  sessions_root=None, is_cancelled=None):
+    """A chain job: several stages, run in order by ``chain.run_chain``.
+
+    Distinct from ``run_job`` because a chain isn't one subprocess call --
+    ``chain.run_chain`` shells out once per stage itself, each through
+    ``run_and_poll`` (the same function ``run_job`` uses below), so a stage's
+    own report.html gets the identical live rebuild-as-results-land behaviour
+    a plain job's does, and cancelling reaches a stage already in flight the
+    same way it reaches a plain job. It writes its own ``chain.json`` and a
+    ``report.html`` at the chain root too (see ``chain._save``) -- the same
+    section-by-section report a plain session gets, one stack per stage.
+    """
+    p = spool.paths(sp)
+    job_id = job.get("id", "job")
+    root = job.get("chain_root")
+    if not root:
+        base = job.get("chain_name") or "chain"
+        root = os.path.join(sessions_root or DEFAULT_SESSIONS,
+                            "chain-%s-%s" % (base, time.strftime("%Y%m%d-%H%M%S")))
+    log_path = os.path.join(p["logs"], job_id + ".log")
+    started = time.time()
+
+    spool.heartbeat(sp, job=job_id, session=root, state="running")
+    spool.note(running_path, session_dir=root)
+
+    def _log(msg):
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except OSError:
+            pass
+
+    def _stop():
+        return bool((should_stop and should_stop()) or (is_cancelled and is_cancelled()))
+
+    try:
+        manifest = chain_mod.run_chain(job["chain_spec"], root, runner=runner,
+                                       log=_log, should_stop=_stop)
+    except Exception as exc:
+        _log("chain failed: %r" % exc)
+        return {"exit_code": 1, "session_dir": root, "log": log_path,
+               "error": repr(exc), "elapsed_sec": round(time.time() - started, 1)}
+
+    return {"exit_code": 0, "session_dir": root, "log": log_path,
+           "chain_root": root, "stopped": bool(manifest.get("stopped")),
+           "stages": len(manifest.get("stages") or []),
+           "elapsed_sec": round(time.time() - started, 1)}
+
+
+def run_and_poll(argv, env, log_path, sessions_root=None, before=None, session_dir=None,
+                 on_report=None, on_session_found=None, on_progress=None,
+                 report_every=REPORT_EVERY, should_stop=None, is_cancelled=None,
+                 preamble=None):
+    """Run one bench-runner subprocess, rebuilding a live report as results land.
+
+    The core of what used to be only ``run_job``'s inner loop, pulled out so a
+    chain stage's subprocess (``chain.py``) gets the identical live-progress
+    behaviour a plain job does: poll every second, rebuild on every new result
+    file, and retune the fallback interval toward roughly ``REPORT_PER_RUN``
+    rebuilds per run. ``on_report(session_dir, running)`` keeps the exact
+    two-argument shape ``run_job`` callers already rely on; the bookkeeping
+    that's specific to a spool-backed job (heartbeats, the running-claim file)
+    hangs off ``on_session_found``/``on_progress`` instead, so this function
+    itself knows nothing about the spool.
+
+    ``session_dir`` -- pass it in when the directory is already known (a
+    judge-only re-score, or a chain stage merging into a fixed directory);
+    leave it ``None`` to have it discovered from what appears under
+    ``sessions_root`` (which then must be given, along with ``before``, the
+    directory listing from just before the subprocess started).
+
+    -> (session_dir, exit_code)
+    """
+    with open(log_path, "w", encoding="utf-8") as log:
+        if preamble:
+            log.write(preamble)
+        if session_dir and on_session_found:
+            on_session_found(session_dir)
+        log.write("$ %s\n\n" % " ".join(argv))
+        log.flush()
+        # Own process group: a stop signal reaches llama-server too, not just
+        # the shell script that launched it.
+        proc = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, env=env,
+                                start_new_session=True)
+        last_report = 0.0
+        interval = report_every       # adapts to how long this session's runs take
+        seen_artifacts = 0
+        last_artifact_at = None
+        try:
+            while proc.poll() is None:
+                if should_stop and should_stop():
+                    raise Stopping()
+                if is_cancelled and is_cancelled():
+                    raise Cancelled()
+                time.sleep(1.0)
+                if session_dir is None and sessions_root is not None:
+                    new = _listing(sessions_root) - (before or set())
+                    if new:
+                        session_dir = os.path.join(sessions_root, sorted(new)[-1])
+                        if on_session_found:
+                            on_session_found(session_dir)
+                if not (session_dir and on_report):
+                    continue
+
+                now = time.time()
+                # A new result file is the only real progress event there is, so
+                # rebuild on it immediately rather than waiting for a tick.
+                count = _artifacts(session_dir)
+                fresh = count > seen_artifacts
+                if fresh:
+                    if last_artifact_at is not None:
+                        # Retune: roughly REPORT_PER_RUN rebuilds per run, so a
+                        # 20-second run polls briskly and a 5-minute one doesn't
+                        # rewrite the page 30 times for nothing.
+                        gap = now - last_artifact_at
+                        interval = min(REPORT_MAX,
+                                       max(REPORT_MIN, gap / REPORT_PER_RUN))
+                    seen_artifacts = count
+                    last_artifact_at = now
+                    if on_progress:
+                        on_progress(session_dir, count, round(interval, 1))
+
+                if fresh or now - last_report >= interval:
+                    last_report = now
+                    try:
+                        on_report(session_dir, True)
+                    except Exception as exc:                  # never kill the run
+                        log.write("\n[roundtable] report failed: %s\n" % exc)
+                        log.flush()
+        except (Stopping, Cancelled):
+            # However the kill goes, the original Stopping/Cancelled has to be
+            # what propagates -- a proc.wait() timeout here is a subprocess.
+            # TimeoutExpired, not one of those two, and the caller's generic
+            # except Exception would otherwise mistake a real shutdown for an
+            # ordinary job failure and keep the loop running past it.
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    proc.wait(timeout=10)
+                except (ProcessLookupError, subprocess.TimeoutExpired):
+                    pass          # a process this stuck is the OS's problem now
+            raise
+        code = proc.returncode
+
+    if session_dir is None and sessions_root is not None:   # nothing was created at all
+        new = _listing(sessions_root) - (before or set())
+        if new:
+            session_dir = os.path.join(sessions_root, sorted(new)[-1])
+    return session_dir, code
+
+
 def run_job(job, running_path, sp=None, runner=None, on_report=None,
             report_every=REPORT_EVERY, should_stop=None, sessions_root=None,
             is_cancelled=None):
@@ -322,103 +480,36 @@ def run_job(job, running_path, sp=None, runner=None, on_report=None,
     # directory to watch for: it is known before the runner starts, and the old
     # panel's verdicts have to be out of the way before the new ones land.
     session_dir = job.get("judge_only") or None
-    with open(log_path, "w", encoding="utf-8") as log:
-        if session_dir:
-            archive = archive_verdicts(session_dir)
-            if archive:
-                log.write("[roundtable] previous verdicts moved to %s\n"
-                          % os.path.basename(archive))
-            _expect_judges(session_dir, len(job.get("judges") or []))
-            _expect_meta(session_dir, job.get("meta_summary", True))
-            # The poll loop below announces the session when it first appears;
-            # this one was never going to appear, so announce it here instead.
-            spool.heartbeat(sp, job=job_id, session=session_dir, state="running")
-            spool.note(running_path, session_dir=session_dir)
-        log.write("$ %s\n\n" % " ".join(argv))
-        log.flush()
-        # Own process group: a stop signal reaches llama-server too, not just
-        # the shell script that launched it.
-        proc = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, env=env,
-                                start_new_session=True)
-        last_report = 0.0
-        interval = report_every       # adapts to how long this session's runs take
-        seen_artifacts = 0
-        last_artifact_at = None
-        try:
-            while proc.poll() is None:
-                if should_stop and should_stop():
-                    raise Stopping()
-                if is_cancelled and is_cancelled():
-                    raise Cancelled()
-                time.sleep(1.0)
-                if session_dir is None:
-                    new = _listing(sessions_root) - before
-                    if new:
-                        session_dir = os.path.join(sessions_root, sorted(new)[-1])
-                        spool.heartbeat(sp, job=job_id, session=session_dir,
-                                        state="running")
-                        # Into the claim file too: a heartbeat does not survive
-                        # a reboot, and whoever reaps this claim afterwards needs
-                        # to know which session was left half-written.
-                        spool.note(running_path, session_dir=session_dir)
-                        # The moment the session exists, say whether a Round 3
-                        # is coming. Written here rather than after the bench
-                        # script exits so the progress bar and the Judge runs
-                        # tile count the synthesis from the first tick instead
-                        # of growing a seventh unit two rounds in.
-                        _expect_meta(session_dir, job.get("meta_summary", True))
-                if not (session_dir and on_report):
-                    continue
+    preamble = ""
+    if session_dir:
+        archive = archive_verdicts(session_dir)
+        if archive:
+            preamble += ("[roundtable] previous verdicts moved to %s\n"
+                        % os.path.basename(archive))
+        _expect_judges(session_dir, len(job.get("judges") or []))
 
-                now = time.time()
-                # A new result file is the only real progress event there is, so
-                # rebuild on it immediately rather than waiting for a tick.
-                count = _artifacts(session_dir)
-                fresh = count > seen_artifacts
-                if fresh:
-                    if last_artifact_at is not None:
-                        # Retune: roughly REPORT_PER_RUN rebuilds per run, so a
-                        # 20-second run polls briskly and a 5-minute one doesn't
-                        # rewrite the page 30 times for nothing.
-                        gap = now - last_artifact_at
-                        interval = min(REPORT_MAX,
-                                       max(REPORT_MIN, gap / REPORT_PER_RUN))
-                    seen_artifacts = count
-                    last_artifact_at = now
-                    spool.heartbeat(sp, job=job_id, session=session_dir,
-                                    state="running", done=count,
-                                    report_interval=round(interval, 1))
+    def _on_session_found(sdir):
+        spool.heartbeat(sp, job=job_id, session=sdir, state="running")
+        # Into the claim file too: a heartbeat does not survive a reboot, and
+        # whoever reaps this claim afterwards needs to know which session was
+        # left half-written.
+        spool.note(running_path, session_dir=sdir)
+        # The moment the session exists, say whether a Round 3 is coming.
+        # Written here rather than after the bench script exits so the
+        # progress bar and the Judge runs tile count the synthesis from the
+        # first tick instead of growing a seventh unit two rounds in.
+        _expect_meta(sdir, job.get("meta_summary", True))
 
-                if fresh or now - last_report >= interval:
-                    last_report = now
-                    try:
-                        on_report(session_dir, True)
-                    except Exception as exc:                  # never kill the run
-                        log.write("\n[roundtable] report failed: %s\n" % exc)
-                        log.flush()
-        except (Stopping, Cancelled):
-            # However the kill goes, the original Stopping/Cancelled has to be
-            # what propagates -- a proc.wait() timeout here is a subprocess.
-            # TimeoutExpired, not one of those two, and the caller's generic
-            # except Exception would otherwise mistake a real shutdown for an
-            # ordinary job failure and keep the loop running past it.
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            try:
-                proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                    proc.wait(timeout=10)
-                except (ProcessLookupError, subprocess.TimeoutExpired):
-                    pass          # a process this stuck is the OS's problem now
-            raise
-        code = proc.returncode
+    def _on_progress(sdir, count, interval):
+        spool.heartbeat(sp, job=job_id, session=sdir, state="running",
+                        done=count, report_interval=interval)
 
-    if session_dir is None:                       # nothing was created at all
-        new = _listing(sessions_root) - before
-        if new:
-            session_dir = os.path.join(sessions_root, sorted(new)[-1])
+    session_dir, code = run_and_poll(
+        argv, env, log_path, sessions_root=sessions_root, before=before,
+        session_dir=session_dir, on_report=on_report,
+        on_session_found=_on_session_found, on_progress=_on_progress,
+        report_every=report_every, should_stop=should_stop,
+        is_cancelled=is_cancelled, preamble=preamble)
 
     ran_meta_summary = False
     if code == 0 and session_dir:
@@ -541,11 +632,12 @@ def loop(sp=None, runner=None, on_report=None, once=False, drain=False,
                          {"error": "cancelled", "cancelled": True}, spool=sp)
             log("cancelled %s before it started" % job_id)
             continue
+        run_fn = run_chain_job if job.get("chain_spec") else run_job
         try:
-            result = run_job(job, running_path, sp=sp, runner=runner,
-                             on_report=on_report, report_every=report_every,
-                             should_stop=stopping, sessions_root=sessions_root,
-                             is_cancelled=cancelled)
+            result = run_fn(job, running_path, sp=sp, runner=runner,
+                            on_report=on_report, report_every=report_every,
+                            should_stop=stopping, sessions_root=sessions_root,
+                            is_cancelled=cancelled)
         except Cancelled:
             # Whatever finished is kept and the session stops calling itself
             # live; the worker takes the next job rather than shutting down.
