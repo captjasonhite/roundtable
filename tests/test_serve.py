@@ -315,6 +315,17 @@ class LiveServerTests(unittest.TestCase):
         self.assertIn("reloadMs = 15000", body)
         self.assertIn("do not eat a draft", body)
 
+    def test_markdown_is_served_to_read_not_to_download(self):
+        """text/markdown makes browsers save the file; the report links these
+        judging documents expecting them to open."""
+        path = self._session_dir("20260101-000010", False)
+        with open(os.path.join(path, "SUMMARIZE.md"), "w") as f:
+            f.write("# what the judges read\n")
+        status, body, headers = self.get("/s/20260101-000010/SUMMARIZE.md")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "text/plain; charset=utf-8")
+        self.assertIn("what the judges read", body)
+
     # --- cancelling and cleaning up -----------------------------------------
 
     def _orphaned_claim(self, job_id="stuck", session_dir=None):

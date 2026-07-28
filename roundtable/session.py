@@ -99,6 +99,21 @@ def _is_result(name):
             and not name.startswith(("SUMMARIZE", "summary_", "round3_", "README")))
 
 
+# A heading on its own line, and the LAST one. Splitting on the first
+# occurrence of the bare string put the reasoning trace into the output for
+# every thinking model that mentioned "## Output" while planning its answer --
+# which is most of them, since the brief names the sections it must produce.
+# Word counts came out two to three times too high, and the drafts looked
+# longer than the ones they were being compared against.
+_OUTPUT_HEADING = re.compile(r"(?m)^#{1,6}\s*Output\s*$")
+
+
+def output_of(body):
+    """The '## Output' section of a result file, without the thinking above it."""
+    parts = _OUTPUT_HEADING.split(body or "")
+    return parts[-1]
+
+
 def read_runs(sdir, key):
     """Benchmark results -> list of dicts, one per run, in file order."""
     label_of = {}
@@ -143,6 +158,16 @@ def read_runs(sdir, key):
                           bool(_num(meta.get("tokens"))
                                and _num(meta.get("tokens")) >= 4096
                                and _num(meta.get("tokens")) % 1024 == 0)),
+            # The brief's checkable demands -- source kept, markers intact,
+            # draft finished. Absent in sessions run before the checker
+            # existed, and in runs whose prompt had nothing to check.
+            "compliance_ok": (meta.get("compliance_ok") == "true"
+                              if "compliance_ok" in meta else None),
+            "compliance_coverage": _num(meta.get("compliance_coverage")),
+            "compliance_faults": meta.get("compliance_faults", ""),
+            # Told what it got wrong and asked once more. Carries no penalty,
+            # but a draft that complied first time is not the same result.
+            "compliance_retry": meta.get("compliance_retry") == "true",
             "body": body,
         })
     return runs
@@ -168,7 +193,7 @@ def read_judges(sdir):
             "elapsed": _num(meta.get("elapsed_sec")),
             "error": None if meta.get("error") in (None, "null", "") else meta.get("error"),
             # Judges reason before answering; the ranking lives after "## Output".
-            "body": body.split("## Output", 1)[-1],
+            "body": output_of(body),
         })
     return judges
 
@@ -195,7 +220,7 @@ def read_meta_summary(sdir):
         "tps": _num(meta.get("tokens_per_sec")),
         "elapsed": _num(meta.get("elapsed_sec")),
         "error": None if meta.get("error") in (None, "null", "") else meta.get("error"),
-        "body": body.split("## Output", 1)[-1],
+        "body": output_of(body),
     }
 
 

@@ -15,6 +15,7 @@ import time
 
 from . import consensus as C
 from . import naming
+from . import session as session_mod
 
 # Palette: the validated default from the data-viz reference (blue sequential
 # ramp, blue<->red diverging pair). Both modes are selected, not auto-flipped.
@@ -438,6 +439,38 @@ def _truncation_warning(session, result):
                "its" if len(cut) == 1 else "their"))
 
 
+def _compliance_warning(session):
+    """Entries that broke the brief's checkable rules, and ones that needed asking twice.
+
+    Kept separate from the standings maths on purpose: nothing here changes a
+    score. A panel cannot be relied on to notice that a draft is missing a
+    paragraph -- six judges ranked one fourth while it was short 300 words of
+    the source -- so the page says it instead.
+    """
+    runs = session.get("runs") or []
+    failed = [r for r in runs if r.get("compliance_ok") is False]
+    retried = [r for r in runs if r.get("compliance_retry")]
+    out = []
+    if failed:
+        items = "; ".join(
+            "%s — %s" % (esc(short_model(r["model"], 26)),
+                         esc(r.get("compliance_faults") or "failed the brief"))
+            for r in failed)
+        out.append('<p class="note warn"><b>%d entr%s did not meet the brief</b> '
+                   '— %s. These are mechanical checks, not taste: text that is '
+                   'missing is missing. The standings below are unchanged, '
+                   'because the panel ranked what it was given.</p>'
+                   % (len(failed), "y" if len(failed) == 1 else "ies", items))
+    if retried:
+        out.append('<p class="note">%s %s asked a second time after failing the '
+                   'check, and the corrected draft is what the panel read. No '
+                   'penalty is applied — but a draft that complied first time '
+                   'is not the same result as one that had to be told.</p>'
+                   % (", ".join(esc(short_model(r["model"], 26)) for r in retried),
+                      "was" if len(retried) == 1 else "were"))
+    return "\n".join(out)
+
+
 def _standings(result, session=None):
     rows = [r for r in result["standings"] if r["score"] is not None]
     if not rows:
@@ -445,6 +478,7 @@ def _standings(result, session=None):
     out = ['<p class="eyebrow">Round 2 &middot; blind judging</p>',
            '<h2>Panel standings</h2>',
            _truncation_warning(session, result) if session else "",
+           _compliance_warning(session) if session else "",
            '<p class="note">Mean percentile across judges, self-votes removed '
            '(1.00 = best of the field, 0.00 = worst). Bars share one scale.</p>',
            _too_close(result),
@@ -763,9 +797,13 @@ def _judges_table(session, rankings):
 
 
 def _body_only(text):
-    """A run's raw body has '## Thinking' then '## Output' -- show the answer."""
-    parts = text.split("## Output", 1)
-    return parts[1].lstrip("\n") if len(parts) > 1 else text
+    """A run's raw body has '## Thinking' then '## Output' -- show the answer.
+
+    Delegated, because getting this wrong is silent: splitting on the first
+    bare "## Output" put half a reasoning trace on the page for any model that
+    named the section while planning its answer.
+    """
+    return session_mod.output_of(text).lstrip("\n")
 
 
 def _rank_order(result):
@@ -806,6 +844,33 @@ def _outputs_section(session, result):
     return "\n".join(out)
 
 
+def _judging_documents(session):
+    """-> links to what the judges were actually shown, or "".
+
+    The page reports what the panel concluded; these two files are what it
+    concluded it *from*. Blind judging means the document the judges read has
+    no model names in it, so the pair is the point: the anonymous document,
+    and the key that turns its tags back into models. Relative links, so they
+    resolve the same whether the report is served or opened off disk.
+    """
+    sdir = session.get("dir")
+    if not sdir:
+        return ""
+    links = []
+    for name, label, hint in (
+            ("SUMMARIZE.md", "blind", "The document the judges read: every "
+             "output under a letter, shuffled, with model, mode and speed "
+             "stripped out"),
+            ("SUMMARIZE-KEY.md", "with model names", "The key: which letter "
+             "was which model. Written for you, never shown to a judge")):
+        if os.path.exists(os.path.join(sdir, name)):
+            links.append('<a href="%s" title="%s">%s</a>'
+                         % (esc(name), esc(hint), esc(label)))
+    if not links:
+        return ""
+    return "What the judges were shown: %s" % " &middot; ".join(links)
+
+
 def _verdicts_section(session, result=None, rankings=None):
     """Round 2's raw verdicts, most representative of the group first.
 
@@ -825,8 +890,11 @@ def _verdicts_section(session, result=None, rankings=None):
     out = ['<p class="eyebrow">Round 2 &middot; blind judging</p>',
           "<h2>Judgements</h2>",
           '<p class="note">Full text of every verdict, ordered by how closely it '
-          'matched the panel&rsquo;s overall consensus (closest first).</p>',
-          '<div class="card">']
+          'matched the panel&rsquo;s overall consensus (closest first).</p>']
+    sources = _judging_documents(session)
+    if sources:
+        out.append('<p class="note">%s</p>' % sources)
+    out.append('<div class="card">')
     for j in judges:
         d = distance[j["file"]]
         note = (" &middot; avg. %s ranks from consensus" % C.fmt(d, 1)

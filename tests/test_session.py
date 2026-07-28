@@ -55,6 +55,20 @@ class SessionShapeTests(unittest.TestCase):
         with open(os.path.join(self.dir, name), "w", encoding="utf-8") as f:
             f.write(text)
 
+    def test_output_survives_a_thinking_trace_that_names_the_heading(self):
+        """A model planning its answer writes "## Output" inside its reasoning.
+
+        Splitting on the first occurrence handed back half the trace as the
+        model's answer -- which inflated every word count for thinking models
+        by two to three times and put reasoning on the report page.
+        """
+        body = ("## Thinking\n\nFirst I will write PART 1, then under "
+                "## Output I will put the draft.\n\n## Output\n\nThe draft.\n")
+        self.assertEqual(session_mod.output_of(body).strip(), "The draft.")
+
+    def test_output_of_a_body_with_no_heading_is_the_whole_body(self):
+        self.assertEqual(session_mod.output_of("just text").strip(), "just text")
+
     def test_started_comes_from_the_directory_stamp(self):
         """Not the directory mtime: every finished run writes into the session
         and would push that forward."""

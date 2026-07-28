@@ -1785,6 +1785,11 @@ def make_handler(root, sp=None):
             if not os.path.isfile(target):
                 return self._error(404, "No such file.")
             ctype = mimetypes.guess_type(target)[0] or "application/octet-stream"
+            # text/markdown makes a browser download the file instead of
+            # showing it, which is useless for the judging documents the
+            # report links to -- they are meant to be read, in place.
+            if ctype == "text/markdown":
+                ctype = "text/plain"
             if ctype.startswith("text/") or ctype == "application/json":
                 ctype += "; charset=utf-8"
             try:

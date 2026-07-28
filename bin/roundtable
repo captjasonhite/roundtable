@@ -23,7 +23,7 @@ import sys
 # realpath, not abspath: this is meant to be symlinked onto PATH.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
-from roundtable import benchmarks, consensus, ranks, report, session as session_mod
+from roundtable import benchmarks, compliance, consensus, ranks, report, session as session_mod
 from roundtable import serve, spool, worker
 
 DEFAULT_ROOT = os.environ.get(
@@ -85,6 +85,44 @@ def cmd_report(args):
     if not args.quiet:
         print("%d report(s) written" % written)
     return 0 if written else 1
+
+
+def cmd_check(args):
+    """Re-check finished sessions against the brief they were given.
+
+    Reads the files on disk, so it works on every session ever run -- including
+    the ones produced before the checker existed, which never had a chance to
+    retry.
+    """
+    targets = list(args.sessions) or find_sessions(args.root)
+    if not targets:
+        print("give a session directory, or none to sweep %s" % args.root,
+              file=sys.stderr)
+        return 2
+    bad = 0
+    for sdir in targets:
+        data = session_mod.load(sdir)
+        if not data:
+            continue
+        source = data["user_prompt"]
+        if not source.strip():
+            continue
+        print("%s" % data["name"])
+        for run in data["runs"]:
+            findings = compliance.check(source, session_mod.output_of(run["body"]))
+            mark = "ok   " if findings["ok"] else "FAULT"
+            if not findings["ok"]:
+                bad += 1
+            print("  %s  %-52s %s"
+                  % (mark, run["model"][:52], compliance.summary(findings)))
+            if args.verbose:
+                for seg in findings["segments"]:
+                    print("           section %d: %d%% kept, %d -> %d words"
+                          % (seg["n"], round(seg["coverage"] * 100),
+                             seg["source_words"], seg["output_words"]))
+                for w in findings["warnings"]:
+                    print("           note: %s" % w["detail"])
+    return 1 if bad else 0
 
 
 def cmd_submit(args):
@@ -235,6 +273,14 @@ def main(argv=None):
                    help="leave the system/user prompt out of the report, for sharing")
     r.add_argument("-q", "--quiet", action="store_true")
     r.set_defaults(func=cmd_report)
+
+    c = subs.add_parser("check", help="check finished drafts against the brief")
+    c.add_argument("sessions", nargs="*", help="session directories")
+    c.add_argument("--root", default=DEFAULT_ROOT, metavar="ROOT",
+                   help="sweep every session under ROOT (default: %s)" % DEFAULT_ROOT)
+    c.add_argument("-v", "--verbose", action="store_true",
+                   help="per-section coverage and bracket notes")
+    c.set_defaults(func=cmd_check)
 
     s = subs.add_parser("submit", help="put a job in the queue")
     s.add_argument("job", help="path to a session.json")

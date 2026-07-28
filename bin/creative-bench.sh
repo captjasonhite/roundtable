@@ -675,6 +675,63 @@ if want and not err and ranking_labels(content) != want:
     except Exception:
         pass                       # a failed retry is the status quo, not a failure
 
+# --- compliance retry --------------------------------------------------------
+# The same idea as the ranking retry above, applied to the deliverable instead
+# of the verdict: the brief's hard requirements are mechanically checkable, so
+# check them rather than hoping six judges notice. One entry in session
+# 20260727-200609 deleted 300 words out of the middle of the manuscript and was
+# ranked fourth by a panel that never spotted it.
+#
+# A failure gets one more attempt, in the same conversation, off the same
+# loaded model, with the faults quoted back to it. There is no scoring penalty
+# -- the goal is the best draft the model can produce -- but the file records
+# that it needed a second ask, because a draft that complied first time is not
+# the same result as one that had to be told.
+comp = None
+comp_retried = False
+comp_tokens = 0
+comp_elapsed = 0.0
+src_path = E.get("REQUIRE_SOURCE", "")
+if src_path and not err and os.path.exists(src_path):
+    sys.path.insert(0, E.get("ROUNDTABLE_ROOT", ""))
+    try:
+        from roundtable import compliance as _comp
+    except Exception:
+        _comp = None
+    if _comp is not None:
+        source_text = rd(src_path)
+        comp = _comp.check(source_text, content)
+        follow = _comp.retry_message(comp)
+        if follow:
+            retry_body = dict(body)
+            retry_body["messages"] = msgs + [
+                {"role": "assistant", "content": content},
+                {"role": "user", "content": follow},
+            ]
+            t1 = time.time()
+            try:
+                rr = urllib.request.Request(
+                    "http://127.0.0.1:%s/v1/chat/completions" % E["PORT"],
+                    data=json.dumps(retry_body).encode(),
+                    headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(rr, timeout=float(E["REQUEST_TIMEOUT"])) as r:
+                    rdata = json.load(r)
+                second = rdata["choices"][0]["message"].get("content") or ""
+                again = _comp.check(source_text, second)
+                # Kept only if it actually fixed something. A second attempt
+                # that is no better is noise, and replacing a draft with a
+                # worse one to reward the effort would be the opposite of the
+                # point.
+                if second.strip() and len(again["faults"]) < len(comp["faults"]):
+                    content = second
+                    comp = again
+                    comp_tokens = (rdata.get("usage") or {}).get("completion_tokens", 0) or 0
+                    comp_elapsed = time.time() - t1
+                    comp_retried = True
+            except Exception:
+                pass               # a failed retry leaves the first draft alone
+
+
 def esc(s):
     return json.dumps(s)  # safe YAML scalar: JSON strings are valid YAML
 
@@ -707,6 +764,16 @@ with open(E["OUT_FILE"], "w") as f:
         f.write("ranking_retry: true\n")
         f.write("ranking_retry_tokens: %d\n" % retry_tokens)
         f.write("ranking_retry_sec: %d\n" % round(retry_elapsed))
+    if comp is not None:
+        f.write("compliance_ok: %s\n" % ("true" if comp["ok"] else "false"))
+        f.write("compliance_coverage: %s\n" % comp["coverage"])
+        if comp["faults"]:
+            f.write("compliance_faults: %s\n"
+                    % esc("; ".join(x["detail"] for x in comp["faults"])))
+        if comp_retried:
+            f.write("compliance_retry: true\n")
+            f.write("compliance_retry_tokens: %d\n" % comp_tokens)
+            f.write("compliance_retry_sec: %d\n" % round(comp_elapsed))
     f.write("---\n\n")
     if err:
         f.write("## Error\n\n```\n%s\n```\n" % err)
@@ -900,6 +967,7 @@ do_run() {
     DRY_PENALTY_LAST_N="$DRY_PENALTY_LAST_N" \
     ACTUAL_CTX="${ACTUAL_CTX:-}" REQUEST_TIMEOUT="$REQUEST_TIMEOUT" \
     REQUIRE_LABELS="${REQUIRE_LABELS:-}" \
+    REQUIRE_SOURCE="${REQUIRE_SOURCE:-}" ROUNDTABLE_ROOT="$ROUNDTABLE_ROOT" \
     RUN_MTP="$HAS_MTP" RUN_SPEC_DRAFT_N_MAX="${SPEC_DRAFT_N_MAX:-2}" \
     python3 "$HELPER" 2>&1
   )"
@@ -927,6 +995,16 @@ do_run() {
 }
 
 # --- pass 1: the benchmark --------------------------------------------------
+# Editing briefs make checkable demands -- keep every source sentence, keep the
+# section markers, reach the end -- and a model that breaks one has not written
+# a worse draft, it has written an incomplete one. Handing the source to the
+# helper turns that check on: a run that fails it is told exactly what is
+# missing and asked once more, in the same conversation, off the same loaded
+# model. No scoring penalty; the result records that it needed the second ask.
+# Only pass 1: a judge is not editing anything.
+if [[ -z "$SUMMARIZE_ONLY_DIR" && -z "$META_SUMMARY_DIR" && "${COMPLIANCE:-1}" == "1" ]]; then
+  REQUIRE_SOURCE="$SDIR/user-prompt.txt"
+fi
 if [[ -n "$SUMMARIZE_ONLY_DIR" ]]; then
   OK_RUNS="$OK_RUNS_PRESET"      # results already on disk from the earlier run
 fi
