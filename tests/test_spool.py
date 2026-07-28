@@ -29,6 +29,15 @@ class SpoolTests(unittest.TestCase):
         self.assertEqual(spool.counts(self.spool)["queue"], 0)
         self.assertEqual(spool.counts(self.spool)["running"], 1)
 
+    def test_auto_ids_do_not_collide_within_the_same_second(self):
+        """pid % 10000 + a same-second timestamp used to be the whole id: two
+        submits from one long-running process (serve.py handling two rapid
+        clicks) minted the same id and the second submit silently clobbered
+        the first job on rename."""
+        ids = {spool.submit({"user_prompt": "x"}, self.spool) for _ in range(20)}
+        self.assertEqual(len(ids), 20)
+        self.assertEqual(spool.counts(self.spool)["queue"], 20)
+
     def test_claim_is_exclusive(self):
         spool.submit({"id": "only-one"}, self.spool)
         first = spool.claim(self.spool)

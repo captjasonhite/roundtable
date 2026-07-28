@@ -398,8 +398,20 @@ def run_job(job, running_path, sp=None, runner=None, on_report=None,
                         log.write("\n[roundtable] report failed: %s\n" % exc)
                         log.flush()
         except (Stopping, Cancelled):
+            # However the kill goes, the original Stopping/Cancelled has to be
+            # what propagates -- a proc.wait() timeout here is a subprocess.
+            # TimeoutExpired, not one of those two, and the caller's generic
+            # except Exception would otherwise mistake a real shutdown for an
+            # ordinary job failure and keep the loop running past it.
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            proc.wait(timeout=30)
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    proc.wait(timeout=10)
+                except (ProcessLookupError, subprocess.TimeoutExpired):
+                    pass          # a process this stuck is the OS's problem now
             raise
         code = proc.returncode
 

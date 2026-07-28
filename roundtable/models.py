@@ -5,12 +5,18 @@ walk over a models root (LM Studio's layout by default) rather than anything
 clever, because that is what the bench runner itself matches against.
 """
 import os
+import re
 
 DEFAULT_ROOT = os.environ.get(
     "ROUNDTABLE_MODELS", os.path.expanduser("~/.lmstudio/models"))
 
 # Projector files are companions to a vision model, never a model to run alone.
 SKIP = ("mmproj",)
+
+# llama.cpp's split-GGUF naming: any part count, not just up to 4 -- a fixed
+# list of "-00001-of-" .. "-00004-of-" left a 5+-part model unmatched, so each
+# shard was listed as its own separate model in the picker instead of one.
+_SPLIT_MARKER = re.compile(r"-\d{5}-of-\d{5}")
 
 
 def discover(root=None):
@@ -42,10 +48,9 @@ def discover(root=None):
     seen, out = set(), []
     for model in sorted(found, key=lambda m: m["name"].lower()):
         stem = model["name"]
-        for marker in ("-00001-of-", "-00002-of-", "-00003-of-", "-00004-of-"):
-            if marker in stem:
-                stem = stem.split(marker)[0]
-                break
+        m = _SPLIT_MARKER.search(stem)
+        if m:
+            stem = stem[:m.start()]
         if stem in seen:
             continue
         seen.add(stem)

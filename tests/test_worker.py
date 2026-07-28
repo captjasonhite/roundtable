@@ -101,6 +101,48 @@ class BuildCommandTests(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class StoppingSurvivesAHungKillTests(unittest.TestCase):
+    """A stop/cancel whose SIGTERM doesn't land within the wait has to escalate
+    and still raise Stopping/Cancelled, not let subprocess.TimeoutExpired --
+    a plain Exception -- escape and get mistaken for an ordinary job failure
+    by the caller's generic handler."""
+
+    def setUp(self):
+        self.spool = tempfile.mkdtemp(prefix="rt-spool-")
+        self.sessions = tempfile.mkdtemp(prefix="rt-sessions-")
+        spool.ensure(self.spool)
+
+    def tearDown(self):
+        shutil.rmtree(self.spool, ignore_errors=True)
+        shutil.rmtree(self.sessions, ignore_errors=True)
+
+    def test_a_hung_sigterm_escalates_to_sigkill_and_still_raises_stopping(self):
+        import subprocess as subprocess_mod
+
+        fake = mock.MagicMock()
+        fake.pid = 4242
+        fake.poll.return_value = None
+        fake.wait.side_effect = [subprocess_mod.TimeoutExpired("stub", 30), None]
+
+        job = {"user_prompt": "hi", "system_prompt": "be brief",
+               "temperature": 1.0, "mode": "thinking", "models": ["stub-alpha"],
+               "sessions_root": self.sessions}
+        spool.submit(job, self.spool)
+        claimed, running_path = spool.claim(self.spool)
+
+        with mock.patch("roundtable.worker.subprocess.Popen", return_value=fake), \
+             mock.patch("roundtable.worker.os.getpgid", return_value=99), \
+             mock.patch("roundtable.worker.os.killpg") as killpg, \
+             mock.patch("roundtable.worker.time.sleep"):
+            with self.assertRaises(worker.Stopping):
+                worker.run_job(claimed, running_path, sp=self.spool,
+                               runner=STUB, should_stop=lambda: True)
+
+        # SIGTERM, then a timed-out wait, then SIGKILL -- not silently dropped.
+        self.assertEqual(killpg.call_count, 2)
+        self.assertEqual(fake.wait.call_count, 2)
+
+
 class WorkerLoopTests(unittest.TestCase):
 
     def setUp(self):

@@ -210,8 +210,17 @@ print("C_PROFILE=%s" % shlex.quote(text))
   # the script defaults in place. Anything that isn't C_*= assignments means the
   # card lookup itself is broken — refusing to start is the point: benchmarking
   # six models on one set of defaults while the report claims per-model card
-  # settings is worse than not running at all.
-  if [[ -n "$out" && ! "$out" =~ ^C_[A-Z_]+= ]]; then
+  # settings is worse than not running at all. Checked line by line: a card
+  # that raises partway through emit() leaves valid C_*= lines followed by a
+  # traceback, and matching only the START of the whole string let that
+  # traceback slip past this guard and into eval below.
+  local bad=0
+  if [[ -n "$out" ]]; then
+    while IFS= read -r line; do
+      [[ "$line" =~ ^C_[A-Z_]+= ]] || { bad=1; break; }
+    done <<< "$out"
+  fi
+  if [[ "$bad" == "1" ]]; then
     echo "  ✗ model cards could not be read — refusing to run with the wrong samplers" >&2
     echo "    PYTHONPATH=$ROUNDTABLE_ROOT" >&2
     printf '    %s\n' "$out" >&2
@@ -993,8 +1002,10 @@ if [[ "${SUMMARIZE_ARG:-}" != "0" ]]; then
 fi
 export JUDGE_SLUGS
 SDIR="$SDIR" TEMP="$TEMP" SEED="$SEED" BLIND="${BLIND:-1}" \
-  JUDGE_SLUGS="${JUDGE_SLUGS:-}" python3 - <<'PYEOF'
+  JUDGE_SLUGS="${JUDGE_SLUGS:-}" PYTHONPATH="$ROUNDTABLE_ROOT" python3 - <<'PYEOF'
 import os, glob, random
+
+from roundtable.session import output_of
 
 sdir = os.environ["SDIR"]
 files = sorted(f for f in glob.glob(os.path.join(sdir, "*.md"))
@@ -1119,8 +1130,10 @@ def render(records, letters):
             # Show ONLY the deliverable. The "## Thinking" section is a dead giveaway:
             # a no-thinking run prints "(none)" there while a thinking run prints a
             # 1000-word trace, which re-leaks the mode the blinding just removed.
-            tail = body.split("## Output", 1)
-            out.append((tail[1] if len(tail) > 1 else body).lstrip("\n"))
+            # output_of() splits on the LAST "## Output" heading, line-anchored --
+            # splitting on the first occurrence hands judges half a reasoning trace
+            # for any thinking model that names the heading while planning its answer.
+            out.append(output_of(body).lstrip("\n"))
         else:
             # Demote the result file's own "## Thinking"/"## Output" headings so they
             # don't outrank the "### model" heading they live under.

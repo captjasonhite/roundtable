@@ -20,6 +20,7 @@ is gone has to be failed by whoever comes next, or it reads as running forever.
 import json
 import os
 import time
+import uuid
 
 STATES = ("queue", "running", "done", "failed")
 
@@ -63,9 +64,15 @@ def submit(job, spool=None):
     spool = ensure(spool)
     job = dict(job)
     job.setdefault("created", time.strftime("%Y-%m-%dT%H:%M:%S"))
-    job_id = job.setdefault(
-        "id", "%s-%04d" % (time.strftime("%Y%m%d-%H%M%S"), os.getpid() % 10000))
     queue = paths(spool)["queue"]
+    # pid % 10000 alone is not unique within a second: a long-running caller
+    # (serve.py handling two rapid submissions) could mint the same id twice
+    # and silently clobber the first job on rename. A few random hex digits on
+    # top makes a same-second collision astronomically unlikely without giving
+    # up the human-readable timestamp prefix.
+    job_id = job.get("id") or "%s-%04d-%s" % (
+        time.strftime("%Y%m%d-%H%M%S"), os.getpid() % 10000, uuid.uuid4().hex[:4])
+    job["id"] = job_id
     staging = os.path.join(queue, "." + job_id + ".json")
     with open(staging, "w", encoding="utf-8") as f:
         json.dump(job, f, indent=2)

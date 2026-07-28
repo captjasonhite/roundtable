@@ -49,7 +49,8 @@ def build_docs(sdir, models, seed="7"):
     with open(helper, "w", encoding="utf-8") as f:
         f.write(block.group(1))
     env = dict(os.environ, SDIR=sdir, TEMP="1.0", SEED=seed, BLIND="1",
-               JUDGE_SLUGS=",".join(models))
+               JUDGE_SLUGS=",".join(models),
+               PYTHONPATH=os.path.dirname(os.path.dirname(SCRIPT)))
     proc = subprocess.run([sys.executable, helper], env=env,
                           capture_output=True, text=True)
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -171,6 +172,38 @@ class CounterbalanceTests(unittest.TestCase):
         parsed = ranks.extract_all(data)[0]
         self.assertEqual(parsed["ranks"][letters[0]], 1.0)
         self.assertTrue(parsed["complete"])
+
+
+class BlindDocumentDoesNotLeakTheThinkingTraceTests(unittest.TestCase):
+    """The blind SUMMARIZE.md used to split a result body on the FIRST
+    "## Output", which lands inside a thinking model's reasoning trace for any
+    model that names the section while planning its answer -- handing judges
+    half a trace as if it were the deliverable, in the one document blinding
+    is supposed to protect."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="rt-cb-leak-")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_a_thinking_trace_that_names_the_heading_does_not_leak(self):
+        body = ("---\nmodel: \"alpha\"\nmodel_path: \"/models/alpha.gguf\"\n"
+                "thinking: true\ntemperature: 1.0\nseed: 7\ntokens: 100\n"
+                "tokens_per_sec: 10.0\nelapsed_sec: 10\nerror: null\n---\n\n"
+                "## Thinking\n\nFirst I will write under ## Output the real "
+                "answer.\n\n## Output\n\nThe real answer.\n")
+        with open(os.path.join(self.dir, "01_x_alpha_thinking.md"),
+                 "w", encoding="utf-8") as f:
+            f.write(body)
+        for name in ("system-prompt.txt", "user-prompt.txt"):
+            with open(os.path.join(self.dir, name), "w", encoding="utf-8") as f:
+                f.write("prompt")
+        build_docs(self.dir, ["alpha"])
+        with open(os.path.join(self.dir, "SUMMARIZE.md"), encoding="utf-8") as f:
+            doc = f.read()
+        self.assertIn("The real answer.", doc)
+        self.assertNotIn("First I will write", doc)
 
 
 if __name__ == "__main__":

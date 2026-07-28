@@ -50,7 +50,7 @@ def _deletter(text, by_label):
         lambda m: by_label.get(m.group(1), m.group(0)), text)
 
 
-def _notes_on(judges, label, by_label, per_judge=1, max_chars=1200):
+def _notes_on(judges, label, by_label, max_chars=1200):
     """The paragraphs judges wrote about one entry, letters resolved to names.
 
     One representative paragraph per judge, bounded so the prompt stays a
