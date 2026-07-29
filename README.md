@@ -187,15 +187,23 @@ manuscript-editing workflow this tab shipped with (editable afterwards —
 overwrite any field to write your own instead), and a checkbox for a final
 synthesis. "+ Add stage" clones a blank card; "Remove this stage" drops one.
 
-The first stage runs the chosen roster; every stage after that automatically
+The first stage runs the chosen roster; every stage in between automatically
 has each of those models continue *its own* previous answer (`use_previous:
-"own"` — see above). That's deliberately the only wiring the tab offers today
-— per-stage rosters, or a shared top-3/top-1 handoff between stages, are real
-things to want and the chain engine already supports them (see the JSON
-fields above), just not from this form yet. Reach for `roundtable chain
-SPEC.json` with a hand-written spec — or edit one, like
-`examples/manuscript-edit-chain.json` — for those combinations in the
-meantime.
+"own"` — see above). The last stage (when there's more than one) is the
+bake-off: it defaults to `use_previous: "all"` with the final synthesis
+checkbox pre-checked, so it's one shared read of every surviving candidate's
+finished output, judged by the whole roster at once — a real "who won"
+verdict across the finished candidates, not another round of each model
+reviewing only its own thread. Overwrite the last card's fields to write your
+own judging prompt (see `examples/manuscript-edit-chain.json`'s judge stage
+for the shape a prompt like that takes — it reads as "score each candidate
+below," not "evaluate the manuscript," since `{{PREVIOUS}}` now holds all of
+them at once).
+
+Per-stage rosters, or a shared top-3/top-1 handoff between *middle* stages,
+are real things to want and the chain engine already supports them (see the
+JSON fields above), just not from this form yet. Reach for `roundtable chain
+SPEC.json` with a hand-written spec for those combinations in the meantime.
 
 Queuing a chain runs it through the same worker and queue as everything else,
 so it never runs at the same time as a single-prompt job (still one model in

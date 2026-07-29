@@ -1015,14 +1015,14 @@ def render_chain(name, stage_entries, running=False, refresh=15, status_note="")
 
     n_done = sum(1 for e in stage_entries if e[4] == "done")
     body = ["<h1>%s</h1>" % esc(name)]
-    body.append('<p class="sub">chain &middot; %d/%d stages%s &middot; generated %s%s</p>'
+    body.append('<p class="sub">chain &middot; %d/%d rounds%s &middot; generated %s%s</p>'
                % (n_done, len(stage_entries),
                   (" &middot; " + esc(status_note)) if status_note else "",
                   stamp,
                   " &middot; <b>running</b>, this page reloads itself" if running else ""))
 
     for i, (stage_name, session, result, rankings, state) in enumerate(stage_entries, 1):
-        body.append('<h2 class="stage-h"><span class="n">Stage %d</span>%s</h2>'
+        body.append('<h2 class="stage-h"><span class="n">Round %d</span>%s</h2>'
                    % (i, esc(stage_name)))
         if state == "queued":
             body.append('<p class="note">Not started yet.</p>')

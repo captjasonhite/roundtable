@@ -775,7 +775,7 @@ class ChainTabTests(unittest.TestCase):
         self.assertEqual(job["chain_spec"]["manuscript_text"], "Once upon a time.")
         self.assertNotIn("manuscript", job["chain_spec"])
 
-    def test_one_roster_lands_on_the_first_stage_and_later_stages_go_own(self):
+    def test_one_roster_lands_on_first_and_last_stage_last_stage_is_bakeoff(self):
         fields = {}
         fields.update(self._stage_fields(0, name="first"))
         fields.update(self._stage_fields(3, name="second"))
@@ -790,8 +790,32 @@ class ChainTabTests(unittest.TestCase):
         self.assertEqual([s["name"] for s in stages], ["first", "second"])
         self.assertEqual(stages[0]["models"], ["stub-a-7B:thinking"])
         self.assertNotIn("use_previous", stages[0])
+        # The last stage is the bake-off: every surviving candidate read at
+        # once and judged by the whole roster, not each model reviewing only
+        # its own thread -- otherwise a chain never produces a "who won"
+        # verdict across the finished candidates.
+        self.assertEqual(stages[1]["use_previous"], "all")
+        self.assertEqual(stages[1]["models"], ["stub-a-7B:thinking"])
+        self.assertTrue(stages[1]["meta_summary"])
+
+    def test_middle_stages_stay_own_only_the_last_stage_is_the_bakeoff(self):
+        fields = {}
+        fields.update(self._stage_fields(0, name="analyze"))
+        fields.update(self._stage_fields(1, name="rewrite"))
+        fields.update(self._stage_fields(2, name="judge"))
+        fields["chain_name"] = "multi"
+        fields["chain_think_on"] = "stub-a-7B"
+        status, _, headers = self.get(
+            "/chain/submit", method="POST",
+            body=urllib.parse.urlencode(fields, doseq=True))
+        self.assertEqual(status, 303)
+        _, job = spool.jobs("queue", self.spool)[0]
+        stages = job["chain_spec"]["stages"]
+        self.assertNotIn("use_previous", stages[0])
         self.assertEqual(stages[1]["use_previous"], "own")
         self.assertNotIn("models", stages[1])
+        self.assertEqual(stages[2]["use_previous"], "all")
+        self.assertEqual(stages[2]["models"], ["stub-a-7B:thinking"])
 
 
 class PresetRouteTests(unittest.TestCase):

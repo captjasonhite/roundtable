@@ -1447,9 +1447,19 @@ def _stages_from_form(parsed):
 
     There is one roster for the whole chain (see ``chain_think_on`` etc. in
     ``_do_chain_submit``), not one per stage: the first stage in index order
-    gets it as ``models``; every later stage gets ``use_previous: "own"`` and
-    no ``models`` of its own, so each of those models continues its own
-    previous answer.
+    gets it as ``models``, and so does the last one (see below); every stage
+    in between gets ``use_previous: "own"`` and no ``models`` of its own, so
+    each of those models continues its own previous answer.
+
+    The last stage (when there is more than one) defaults to
+    ``use_previous: "all"`` instead of ``"own"``, with ``meta_summary`` on --
+    a bake-off: one shared read of every surviving candidate at once, judged
+    by the whole roster, rather than each model only ever reviewing its own
+    thread. That is the only way a chain ends with an actual "who won"
+    verdict across the finished candidates instead of N parallel self-reviews
+    aggregated after the fact. Middle stages stay "own" -- that is still
+    where the editing work happens; only the final verdict needs everyone
+    looking at everyone else's output.
     """
     matches = [_STAGE_FIELD_RE.match(k) for k in parsed]
     indices = sorted({int(m.group(1)) for m in matches if m})
@@ -1457,7 +1467,8 @@ def _stages_from_form(parsed):
     for pos, i in enumerate(indices):
         def get(field, default=""):
             return (parsed.get("stage_%d_%s" % (i, field)) or [default])[-1]
-        meta_summary = bool(get("meta_summary"))
+        is_last = pos == len(indices) - 1 and pos > 0
+        meta_summary = bool(get("meta_summary")) or is_last
         name = get("name").strip()
         system_prompt = get("system_prompt")
         user_prompt = get("user_prompt")
@@ -1470,7 +1481,7 @@ def _stages_from_form(parsed):
         if meta_summary:
             stage["meta_summary"] = True
         if pos > 0:
-            stage["use_previous"] = "own"
+            stage["use_previous"] = "all" if is_last else "own"
         spec_stages.append(stage)
     return stage_values, spec_stages
 
@@ -2058,6 +2069,8 @@ def make_handler(root, sp=None):
                 return fail("Pick at least one model, or give a pattern to match.")
             if spec_stages:
                 spec_stages[0]["models"] = models
+                if len(spec_stages) > 1:
+                    spec_stages[-1]["models"] = models
 
             spec = {"stages": spec_stages}
             if manuscript:
